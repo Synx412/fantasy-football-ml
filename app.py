@@ -451,18 +451,40 @@ def render_competition(
             )
 
         with st.expander("ML player rankings", expanded=True):
+            show_excluded = st.checkbox(
+                "Show players below minimum start probability",
+                value=False,
+                key=f"show_excluded_{config.key}",
+                help=(
+                    "Off by default so rotation players and likely substitutes do not appear near the top "
+                    "of the usable fantasy rankings."
+                ),
+            )
+            rankings = predicted.copy()
+            rankings["selection_status"] = rankings["start_probability"].apply(
+                lambda probability: (
+                    "Eligible" if probability >= minimum_start else "Excluded - low start chance"
+                )
+            )
+            if not show_excluded:
+                rankings = rankings[rankings["start_probability"] >= minimum_start].copy()
+                st.caption(
+                    f"Showing only players with at least {minimum_start:.0%} start probability. "
+                    "Turn on the option above to inspect excluded players."
+                )
+
             display_columns = [
-                "name", "club", "position", "price", "predicted_points", "predicted_points_p10",
-                "predicted_points_p90", "point_uncertainty", "value_score", "start_probability",
-                "appearance_probability", "expected_minutes_next", "projection_confidence",
-                "next_opponent", "fixture_difficulty", "team_matches_observed",
+                "name", "club", "position", "price", "predicted_points", "selection_status",
+                "predicted_points_p10", "predicted_points_p90", "point_uncertainty", "value_score",
+                "start_probability", "appearance_probability", "expected_minutes_next",
+                "projection_confidence", "next_opponent", "fixture_difficulty", "team_matches_observed",
                 "recent_start_rate", "recent_lineup_matches",
                 "lineup_consensus_probability", "lineup_source_count", "lineup_status",
                 "lineup_intelligence_note", "injury_reason", "price_source",
             ]
             st.dataframe(
-                predicted.sort_values("predicted_points", ascending=False)[
-                    [column for column in display_columns if column in predicted.columns]
+                rankings.sort_values("predicted_points", ascending=False)[
+                    [column for column in display_columns if column in rankings.columns]
                 ].head(150),
                 use_container_width=True,
                 hide_index=True,
