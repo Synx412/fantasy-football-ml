@@ -1,0 +1,47 @@
+FANTASY XI ML v5 — START HERE
+
+This build is for free/non-wagering fantasy football analysis only.
+
+WHAT TO USE IN THE APP
+1. Prediction horizon: 1 for the next matchday.
+2. Minimum ML start probability: 0.60.
+3. Uncertainty penalty: 0.30.
+4. Keep "Check confirmed lineups near kickoff" ON if you have an API-Football key.
+5. Press "Refresh live data now" before generating your squad, especially close to kickoff.
+6. Then press "Generate best team".
+
+DATA PRIORITY
+Highest confidence: confirmed lineup -> recent actual lineup history -> multi-source predicted-lineup consensus -> ML start model -> season prior.
+
+OPTIONAL RECENT-LINEUP SCRAPER
+Install the training stack:
+  python -m pip install -r requirements-training.txt
+
+Then run:
+  python scripts/fetch_recent_lineup_history.py --season 2026-27 --matches-per-team 6
+
+Upload the resulting data/recent_lineup_history.csv in the app.
+
+OPTIONAL MULTI-SOURCE PREDICTED LINEUPS
+Use data/lineup_intelligence_template.csv.
+Each source gets one row per player with starter/bench status.
+The app combines the sources; it does not hard-code special treatment for any player.
+
+LOCAL RUN
+  python -m pip install -r requirements.txt
+  streamlit run app.py
+
+STREAMLIT COMMUNITY CLOUD
+1. Put the CONTENTS of this folder at the root of your GitHub repository.
+2. The repository root must contain app.py and requirements.txt.
+3. In Streamlit Cloud, set Main file path to app.py.
+4. Add secrets if you use live non-PL data / confirmed lineups:
+     API_FOOTBALL_KEY = "your_key"
+     FOOTBALL_DATA_TOKEN = "your_optional_token"
+5. Reboot/redeploy the app after replacing the repo files.
+
+IMPORTANT
+- The Marmoush/Gabriel Jesus issue is fixed globally, not by player name.
+- The entire 15-player pool must pass the minimum-start filter before optimization.
+- Confirmed lineups override the model only for the immediate fixture.
+- No model can guarantee real football selections or fantasy points.
