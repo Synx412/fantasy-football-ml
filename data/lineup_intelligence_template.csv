@@ -1,0 +1,4 @@
+source,name,club,status,source_weight,confirmed
+Source A,Example Player,Example Club,starter,1.0,false
+Source B,Example Player,Example Club,bench,1.0,false
+Source C,Example Player,Example Club,starter,1.0,false

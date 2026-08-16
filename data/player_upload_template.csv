@@ -1,0 +1,5 @@
+name,club,position,price,minutes,appearances,rating,goals,assists,clean_sheets,yellow_cards,red_cards,xg,xa,form,chance_playing,injury_reason
+Example Goalkeeper,Example FC,GK,4.5,900,10,6.8,0,0,4,0,0,0,0,4.2,1.0,
+Example Defender,Example FC,DEF,5.0,850,10,7.0,1,2,4,2,0,0.8,1.4,5.0,1.0,
+Example Midfielder,Another FC,MID,8.0,810,10,7.3,4,3,2,1,0,3.8,2.9,7.1,1.0,
+Example Forward,Another FC,FWD,9.5,780,10,7.4,7,2,1,1,0,6.5,1.7,8.0,0.75,Knock - monitor
