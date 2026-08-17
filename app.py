@@ -596,13 +596,23 @@ def render_competition(
             )
 
         with st.expander("ML player rankings", expanded=True):
-            show_excluded = st.checkbox(
+            ranking_controls = st.columns(2)
+            show_excluded = ranking_controls[0].checkbox(
                 "Show players below minimum start probability",
                 value=False,
                 key=f"show_excluded_{config.key}",
                 help=(
                     "Off by default so rotation players and likely substitutes do not appear near the top "
                     "of the usable fantasy rankings."
+                ),
+            )
+            show_source_xp = ranking_controls[1].checkbox(
+                "Show individual source xP",
+                value=False,
+                key=f"show_source_xp_{config.key}",
+                help=(
+                    "Shows the separate Base/FPL, ESPN, Understat and ClubElo expected-points "
+                    "estimates directly beside the final combined predicted points."
                 ),
             )
             rankings = predicted.copy()
@@ -618,8 +628,17 @@ def render_competition(
                     "Turn on the option above to inspect excluded players."
                 )
 
+            source_xp_columns = [
+                "xp_base_provider",
+                "xp_espn",
+                "xp_understat",
+                "xp_clubelo",
+            ] if show_source_xp else []
+
             display_columns = [
-                "name", "club", "position", "price", "predicted_points", "selection_status",
+                "name", "club", "position", "price", "predicted_points",
+                *source_xp_columns,
+                "selection_status",
                 "predicted_points_p10", "predicted_points_p90", "point_uncertainty", "value_score",
                 "start_probability", "appearance_probability", "expected_minutes_next",
                 "projection_confidence", "next_opponent", "fixture_difficulty", "team_matches_observed",
@@ -629,12 +648,43 @@ def render_competition(
                 "understat_xg", "understat_xa", "understat_matches",
                 "sofascore_strength", "clubelo_strength",
             ]
+            ranking_view = rankings.sort_values("predicted_points", ascending=False)[
+                [column for column in display_columns if column in rankings.columns]
+            ].head(150)
+
+            column_config = {
+                "predicted_points": st.column_config.NumberColumn(
+                    "Total xP",
+                    format="%.2f",
+                    help="Final expected fantasy points after combining the available source projections.",
+                ),
+                "xp_base_provider": st.column_config.NumberColumn(
+                    "FPL/Base xP",
+                    format="%.2f",
+                    help="Expected points from the primary/base provider view.",
+                ),
+                "xp_espn": st.column_config.NumberColumn(
+                    "ESPN xP",
+                    format="%.2f",
+                    help="Expected points using ESPN recent lineup/minutes evidence.",
+                ),
+                "xp_understat": st.column_config.NumberColumn(
+                    "Understat xP",
+                    format="%.2f",
+                    help="Expected points using Understat attacking-performance evidence.",
+                ),
+                "xp_clubelo": st.column_config.NumberColumn(
+                    "ClubElo xP",
+                    format="%.2f",
+                    help="Expected points using ClubElo team/opponent-strength evidence.",
+                ),
+            }
+
             st.dataframe(
-                rankings.sort_values("predicted_points", ascending=False)[
-                    [column for column in display_columns if column in rankings.columns]
-                ].head(150),
+                ranking_view,
                 use_container_width=True,
                 hide_index=True,
+                column_config=column_config,
             )
 
         with st.expander("Availability feed"):
