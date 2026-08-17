@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import math
 import re
+from io import StringIO
+from datetime import timedelta
+
+import requests
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +23,50 @@ SOCCERDATA_LEAGUES = {
     "Serie A": "ITA-Serie A",
     "Ligue 1": "FRA-Ligue 1",
     "Champions League": "INT-Champions League",
+}
+
+
+ESPN_DIRECT_LEAGUES = {
+    "Premier League": "eng.1",
+    "La Liga": "esp.1",
+    "Bundesliga": "ger.1",
+    "Serie A": "ita.1",
+    "Ligue 1": "fra.1",
+    "Champions League": "uefa.champions",
+}
+
+UNDERSTAT_DIRECT_LEAGUES = {
+    "Premier League": "EPL",
+    "La Liga": "La_liga",
+    "Bundesliga": "Bundesliga",
+    "Serie A": "Serie_A",
+    "Ligue 1": "Ligue_1",
+}
+
+SOFASCORE_DIRECT_NAMES = {
+    "Premier League": {"Premier League"},
+    "La Liga": {"LaLiga", "La Liga"},
+    "Bundesliga": {"Bundesliga"},
+    "Serie A": {"Serie A"},
+    "Ligue 1": {"Ligue 1"},
+    "Champions League": {"UEFA Champions League", "Champions League"},
+}
+
+CLUBELO_COUNTRIES = {
+    "Premier League": "ENG",
+    "La Liga": "ESP",
+    "Bundesliga": "GER",
+    "Serie A": "ITA",
+    "Ligue 1": "FRA",
+}
+
+_DIRECT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -359,6 +407,415 @@ def _fetch_clubelo(sd, league: str) -> pd.DataFrame:
     return out.dropna(subset=["elo"]).drop_duplicates("club", keep="last").reset_index(drop=True)
 
 
+
+def _direct_json(url: str, timeout: int = 20) -> Any:
+    response = requests.get(url, headers=_DIRECT_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except Exception as exc:
+        raise SoccerDataError(f"Direct source returned non-JSON data from {url}: {exc}") from exc
+
+
+def _direct_text(url: str, timeout: int = 20) -> str:
+    response = requests.get(url, headers=_DIRECT_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    return response.text
+
+
+def _sub_clock(value: Any) -> float | None:
+    if isinstance(value, dict):
+        clock = value.get("clock") or {}
+        value = clock.get("displayValue")
+    return _parse_minute(value, None)
+
+
+def _direct_espn_recent(
+    competition: str,
+    season: int,
+    recent_matches: int,
+) -> pd.DataFrame:
+    league_id = ESPN_DIRECT_LEAGUES.get(competition)
+    if not league_id:
+        raise SoccerDataError(f"No direct ESPN mapping for {competition}.")
+
+    base = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}"
+
+    def completed_events_for_season(start_year: int) -> list[dict[str, Any]]:
+        # ESPN exposes a season calendar from the July-1 scoreboard response.
+        seed = _direct_json(f"{base}/scoreboard?dates={start_year}0701")
+        leagues = seed.get("leagues") or []
+        calendar = leagues[0].get("calendar", []) if leagues else []
+
+        now = datetime.now(tz=timezone.utc)
+        dates: list[datetime] = []
+        for raw in calendar:
+            try:
+                parsed = pd.to_datetime(raw, utc=True).to_pydatetime()
+            except Exception:
+                continue
+            if parsed <= now:
+                dates.append(parsed)
+
+        # Recent match dates only. 10 dates is normally several matchweeks and
+        # avoids dozens of unnecessary requests.
+        dates = sorted(dates)[-10:]
+        events: list[dict[str, Any]] = []
+        for dt in dates:
+            payload = _direct_json(f"{base}/scoreboard?dates={dt.strftime('%Y%m%d')}")
+            for event in payload.get("events", []) or []:
+                status = ((event.get("status") or {}).get("type") or {})
+                if bool(status.get("completed")) or str(status.get("state", "")).lower() == "post":
+                    events.append(event)
+        # newest first, unique by id
+        unique: dict[str, dict[str, Any]] = {}
+        for event in sorted(events, key=lambda e: str(e.get("date", "")), reverse=True):
+            eid = str(event.get("id", ""))
+            if eid and eid not in unique:
+                unique[eid] = event
+        return list(unique.values())
+
+    events = completed_events_for_season(int(season))
+    if not events:
+        # Useful at the start of a new season before any league match has been played.
+        events = completed_events_for_season(int(season) - 1)
+
+    if not events:
+        raise SoccerDataError("ESPN direct fallback found no completed matches.")
+
+    # Cap summary calls to keep Streamlit fast. Newest matches have priority.
+    events = events[: min(36, max(12, int(recent_matches) * 8))]
+    rows: list[dict[str, Any]] = []
+
+    for event in events:
+        event_id = str(event.get("id", ""))
+        if not event_id:
+            continue
+        try:
+            data = _direct_json(f"{base}/summary?event={event_id}")
+        except Exception:
+            continue
+
+        rosters = data.get("rosters") or []
+        box_form = ((data.get("boxscore") or {}).get("form") or [])
+        event_date = pd.to_datetime(event.get("date"), errors="coerce", utc=True)
+
+        for team_idx, roster_block in enumerate(rosters[:2]):
+            roster = roster_block.get("roster") or []
+            team_name = ""
+            if team_idx < len(box_form):
+                team_name = ((box_form[team_idx].get("team") or {}).get("displayName") or "")
+            if not team_name:
+                team_name = ((roster_block.get("team") or {}).get("displayName") or "")
+
+            for p in roster:
+                athlete = p.get("athlete") or {}
+                name = athlete.get("displayName")
+                if not name:
+                    continue
+
+                starter = bool(p.get("starter", False))
+                sub_in_obj = p.get("subbedIn")
+                sub_out_obj = p.get("subbedOut")
+
+                def did_sub(obj: Any) -> bool:
+                    if isinstance(obj, bool):
+                        return obj
+                    if isinstance(obj, dict):
+                        return bool(obj.get("didSub"))
+                    return False
+
+                did_in = did_sub(sub_in_obj)
+                did_out = did_sub(sub_out_obj)
+
+                if starter:
+                    minute_in = 0.0
+                elif did_in:
+                    minute_in = _sub_clock(sub_in_obj)
+                else:
+                    minute_in = None
+
+                if (starter or did_in) and not did_out:
+                    minute_out = 90.0
+                elif did_out:
+                    minute_out = _sub_clock(sub_out_obj)
+                else:
+                    minute_out = None
+
+                if minute_in is None:
+                    minutes = 0.0
+                else:
+                    minutes = max(0.0, min(90.0, (minute_out if minute_out is not None else 90.0) - minute_in))
+
+                rows.append(
+                    {
+                        "name": str(name),
+                        "club": str(team_name),
+                        "game_key": event_id,
+                        "event_date": event_date,
+                        "started": float(starter),
+                        "minutes": float(minutes),
+                    }
+                )
+
+    lineup = pd.DataFrame(rows)
+    if lineup.empty:
+        raise SoccerDataError("ESPN direct fallback returned no usable lineup rows.")
+
+    lineup = lineup.sort_values(["event_date", "game_key"], na_position="first")
+    result_rows: list[dict[str, Any]] = []
+    for (name, club), group in lineup.groupby(["name", "club"], sort=False):
+        recent = group.tail(max(1, int(recent_matches)))
+        result_rows.append(
+            {
+                "name": name,
+                "club": club,
+                "recent_start_rate": float(recent["started"].mean()),
+                "recent_lineup_matches": float(len(recent)),
+                "recent_minutes": float(recent["minutes"].mean()),
+                "espn_recent_starts": float(recent["started"].sum()),
+            }
+        )
+    return pd.DataFrame(result_rows)
+
+
+def _direct_understat_players(competition: str, season: int) -> pd.DataFrame:
+    slug = UNDERSTAT_DIRECT_LEAGUES.get(competition)
+    if not slug:
+        raise SoccerDataError(f"Understat direct fallback is not configured for {competition}.")
+
+    def fetch_year(year: int) -> dict[str, Any]:
+        url = f"https://understat.com/getLeagueData/{slug}/{year}"
+        return _direct_json(url)
+
+    data = fetch_year(int(season))
+    players = data.get("players") or []
+    if not players:
+        # At the very beginning of a season, use the previous season as a
+        # statistical prior rather than reporting a false connection failure.
+        data = fetch_year(int(season) - 1)
+        players = data.get("players") or []
+
+    if not players:
+        raise SoccerDataError("Understat direct fallback returned no player rows.")
+
+    rows: list[dict[str, Any]] = []
+    for p in players:
+        games = safe_float(p.get("games"), 0.0)
+        minutes = safe_float(p.get("time"), 0.0)
+        appearances = max(games, 0.0)
+        # League-level endpoint has no explicit starts. Estimate only for the
+        # base pool; ESPN recent lineups override this signal where available.
+        starts_est = min(appearances, max(0.0, minutes / 75.0))
+        team = str(p.get("team_title") or "")
+        if "," in team:
+            team = team.split(",", 1)[0].strip()
+        rows.append(
+            {
+                "name": str(p.get("player_name") or ""),
+                "club": team,
+                "position": _position_group(p.get("position")),
+                "minutes": minutes,
+                "appearances": appearances,
+                "starts": starts_est,
+                "goals": safe_float(p.get("goals"), 0.0),
+                "assists": safe_float(p.get("assists"), 0.0),
+                "shots": safe_float(p.get("shots"), 0.0),
+                "xg": safe_float(p.get("xG"), 0.0),
+                "xa": safe_float(p.get("xA"), 0.0),
+                "yellow_cards": safe_float(p.get("yellow_cards"), 0.0),
+                "red_cards": safe_float(p.get("red_cards"), 0.0),
+                "xg_chain": safe_float(p.get("xGChain"), 0.0),
+                "xg_buildup": safe_float(p.get("xGBuildup"), 0.0),
+                "understat_matches": appearances,
+            }
+        )
+    out = pd.DataFrame(rows)
+    out = out[out["name"].astype(str).str.len().gt(0)].reset_index(drop=True)
+    if out.empty:
+        raise SoccerDataError("Understat direct fallback could not normalize player rows.")
+    return out
+
+
+def _season_matches_sofascore(raw: dict[str, Any], season: int) -> dict[str, Any] | None:
+    target = int(season)
+    yy = str(target)[-2:]
+    next_yy = str(target + 1)[-2:]
+    for item in raw.get("seasons", []) or []:
+        candidates = " ".join(
+            str(item.get(k, "")) for k in ("name", "year")
+        )
+        if str(target) in candidates or f"{yy}/{next_yy}" in candidates or f"{yy}-{next_yy}" in candidates:
+            return item
+    # Current seasons are normally returned first.
+    seasons = raw.get("seasons", []) or []
+    return seasons[0] if seasons else None
+
+
+def _direct_sofascore(
+    competition: str,
+    season: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    wanted = SOFASCORE_DIRECT_NAMES.get(competition)
+    if not wanted:
+        raise SoccerDataError(f"No direct SofaScore mapping for {competition}.")
+
+    base = "https://api.sofascore.com/api/v1"
+    cfg = _direct_json(f"{base}/config/default-unique-tournaments/EN/football")
+    tournaments = cfg.get("uniqueTournaments") or []
+
+    tournament = None
+    wanted_lower = {x.lower() for x in wanted}
+    for item in tournaments:
+        if str(item.get("name", "")).strip().lower() in wanted_lower:
+            tournament = item
+            break
+    if tournament is None:
+        raise SoccerDataError(f"SofaScore direct fallback could not locate {competition}.")
+
+    tournament_id = int(tournament["id"])
+    season_data = _direct_json(f"{base}/unique-tournament/{tournament_id}/seasons")
+    chosen = _season_matches_sofascore(season_data, season)
+    if chosen is None:
+        raise SoccerDataError("SofaScore direct fallback could not identify the season.")
+    season_id = int(chosen["id"])
+
+    standings = _direct_json(
+        f"{base}/unique-tournament/{tournament_id}/season/{season_id}/standings/total"
+    )
+    table_rows: list[dict[str, Any]] = []
+    blocks = standings.get("standings") or []
+    for row in (blocks[0].get("rows", []) if blocks else []):
+        team = row.get("team") or {}
+        table_rows.append(
+            {
+                "team": team.get("name", ""),
+                "MP": row.get("matches", 0),
+                "W": row.get("wins", 0),
+                "D": row.get("draws", 0),
+                "L": row.get("losses", 0),
+                "GF": row.get("scoresFor", 0),
+                "GA": row.get("scoresAgainst", 0),
+                "GD": safe_float(row.get("scoresFor"), 0.0) - safe_float(row.get("scoresAgainst"), 0.0),
+                "Pts": row.get("points", 0),
+            }
+        )
+    table = pd.DataFrame(table_rows)
+
+    # Schedule is useful as a cross-check, but don't turn one optional schedule
+    # endpoint into a total SofaScore failure.
+    schedule_rows: list[dict[str, Any]] = []
+    try:
+        rounds_data = _direct_json(
+            f"{base}/unique-tournament/{tournament_id}/season/{season_id}/rounds"
+        )
+        rounds = rounds_data.get("rounds") or []
+        # Current/recent rounds only to keep requests low.
+        round_numbers = [r.get("round") for r in rounds if r.get("round") is not None][-4:]
+        for number in round_numbers:
+            payload = _direct_json(
+                f"{base}/unique-tournament/{tournament_id}/season/{season_id}/events/round/{number}"
+            )
+            for event in payload.get("events", []) or []:
+                schedule_rows.append(
+                    {
+                        "round": number,
+                        "week": ((event.get("roundInfo") or {}).get("round")),
+                        "date": datetime.fromtimestamp(
+                            safe_float(event.get("startTimestamp"), 0.0), tz=timezone.utc
+                        ),
+                        "home_team": ((event.get("homeTeam") or {}).get("name", "")),
+                        "away_team": ((event.get("awayTeam") or {}).get("name", "")),
+                        "game_id": event.get("id"),
+                    }
+                )
+    except Exception:
+        pass
+
+    if table.empty and not schedule_rows:
+        raise SoccerDataError("SofaScore direct fallback returned no table or schedule rows.")
+    return table, pd.DataFrame(schedule_rows)
+
+
+def _direct_clubelo(competition: str) -> pd.DataFrame:
+    datestring = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    errors: list[str] = []
+    content = None
+    for scheme in ("https", "http"):
+        try:
+            content = _direct_text(f"{scheme}://api.clubelo.com/{datestring}")
+            if content.strip():
+                break
+        except Exception as exc:
+            errors.append(str(exc))
+    if not content:
+        raise SoccerDataError("ClubElo direct fallback failed: " + " | ".join(errors[-2:]))
+
+    raw = pd.read_csv(StringIO(content))
+    raw.columns = [str(c).strip().lower() for c in raw.columns]
+    club_col = _pick_column(raw, "club", "team")
+    elo_col = _pick_column(raw, "elo")
+    country_col = _pick_column(raw, "country")
+    level_col = _pick_column(raw, "level")
+    if club_col is None or elo_col is None:
+        raise SoccerDataError("ClubElo CSV did not contain club/team and Elo columns.")
+
+    country = CLUBELO_COUNTRIES.get(competition)
+    out = raw.copy()
+    if country and country_col:
+        filtered = out[out[country_col].astype(str).str.upper().eq(country)].copy()
+        if level_col:
+            level1 = filtered[pd.to_numeric(filtered[level_col], errors="coerce").eq(1)].copy()
+            if not level1.empty:
+                filtered = level1
+        if not filtered.empty:
+            out = filtered
+
+    result = out[[club_col, elo_col]].rename(columns={club_col: "club", elo_col: "elo"})
+    result["elo"] = pd.to_numeric(result["elo"], errors="coerce")
+    result = result.dropna(subset=["elo"]).drop_duplicates("club", keep="last").reset_index(drop=True)
+    if result.empty:
+        raise SoccerDataError("ClubElo direct fallback returned no usable ratings.")
+    return result
+
+
+def _run_with_direct_fallback(
+    source_name: str,
+    soccerdata_call,
+    direct_call,
+    success_message: str,
+) -> tuple[Any, dict[str, Any]]:
+    first_error = None
+    try:
+        value = soccerdata_call()
+        rows = len(value[0]) if isinstance(value, tuple) else len(value)
+        return value, {
+            "ok": True,
+            "message": f"SoccerData path — {success_message}",
+            "rows": rows,
+            "route": "SoccerData",
+        }
+    except Exception as exc:
+        first_error = str(exc)
+
+    try:
+        value = direct_call()
+        rows = len(value[0]) if isinstance(value, tuple) else len(value)
+        return value, {
+            "ok": True,
+            "message": f"Direct fallback — {success_message}",
+            "rows": rows,
+            "route": "Direct",
+            "soccerdata_error": first_error,
+        }
+    except Exception as exc:
+        return None, {
+            "ok": False,
+            "message": f"SoccerData failed: {first_error} | Direct fallback failed: {exc}",
+            "rows": 0,
+            "route": "Failed",
+        }
+
 def fetch_soccerdata_bundle(
     competition: str,
     season: int,
@@ -370,51 +827,71 @@ def fetch_soccerdata_bundle(
     if not league:
         message = f"No SoccerData league mapping is configured for {competition}."
         return SoccerDataBundle(empty, empty, empty, empty, empty, {
-            source: {"ok": False, "message": message, "rows": 0}
+            source: {"ok": False, "message": message, "rows": 0, "route": "Failed"}
             for source in ["ESPN", "Understat", "SofaScore", "ClubElo"]
         })
 
+    # Import failure should not disable direct fallbacks.
     try:
         sd = _load_soccerdata()
+        sd_error = None
     except SoccerDataError as exc:
-        return SoccerDataBundle(empty, empty, empty, empty, empty, {
-            source: {"ok": False, "message": str(exc), "rows": 0}
-            for source in ["ESPN", "Understat", "SofaScore", "ClubElo"]
-        })
+        sd = None
+        sd_error = str(exc)
 
-    understat = empty
-    espn = empty
-    sofa_table = empty
-    sofa_schedule = empty
-    elo = empty
+    def unavailable():
+        raise SoccerDataError(sd_error or "SoccerData import is unavailable.")
 
-    try:
-        understat = _fetch_understat(sd, league, season)
-        status["Understat"] = {"ok": True, "message": "player-match xG/xA loaded", "rows": len(understat)}
-    except Exception as exc:
-        status["Understat"] = {"ok": False, "message": str(exc), "rows": 0}
+    understat_call = (
+        (lambda: _fetch_understat(sd, league, season)) if sd is not None else unavailable
+    )
+    understat, status["Understat"] = _run_with_direct_fallback(
+        "Understat",
+        understat_call,
+        lambda: _direct_understat_players(competition, season),
+        "player xG/xA statistics loaded",
+    )
+    if understat is None:
+        understat = empty
 
-    try:
-        espn = _fetch_espn_recent(sd, league, season, recent_matches)
-        status["ESPN"] = {"ok": True, "message": "recent actual lineups loaded", "rows": len(espn)}
-    except Exception as exc:
-        status["ESPN"] = {"ok": False, "message": str(exc), "rows": 0}
+    espn_call = (
+        (lambda: _fetch_espn_recent(sd, league, season, recent_matches))
+        if sd is not None else unavailable
+    )
+    espn, status["ESPN"] = _run_with_direct_fallback(
+        "ESPN",
+        espn_call,
+        lambda: _direct_espn_recent(competition, season, recent_matches),
+        "recent actual lineup/minutes data loaded",
+    )
+    if espn is None:
+        espn = empty
 
-    try:
-        sofa_table, sofa_schedule = _fetch_sofascore(sd, league, season)
-        status["SofaScore"] = {
-            "ok": True,
-            "message": f"table + schedule loaded ({len(sofa_schedule)} schedule rows)",
-            "rows": len(sofa_table),
-        }
-    except Exception as exc:
-        status["SofaScore"] = {"ok": False, "message": str(exc), "rows": 0}
+    sofa_call = (
+        (lambda: _fetch_sofascore(sd, league, season)) if sd is not None else unavailable
+    )
+    sofa_value, status["SofaScore"] = _run_with_direct_fallback(
+        "SofaScore",
+        sofa_call,
+        lambda: _direct_sofascore(competition, season),
+        "league table/schedule data loaded",
+    )
+    if sofa_value is None:
+        sofa_table, sofa_schedule = empty, empty
+    else:
+        sofa_table, sofa_schedule = sofa_value
 
-    try:
-        elo = _fetch_clubelo(sd, league)
-        status["ClubElo"] = {"ok": True, "message": "current club Elo ratings loaded", "rows": len(elo)}
-    except Exception as exc:
-        status["ClubElo"] = {"ok": False, "message": str(exc), "rows": 0}
+    elo_call = (
+        (lambda: _fetch_clubelo(sd, league)) if sd is not None else unavailable
+    )
+    elo, status["ClubElo"] = _run_with_direct_fallback(
+        "ClubElo",
+        elo_call,
+        lambda: _direct_clubelo(competition),
+        "current club Elo ratings loaded",
+    )
+    if elo is None:
+        elo = empty
 
     return SoccerDataBundle(understat, espn, sofa_table, sofa_schedule, elo, status)
 
