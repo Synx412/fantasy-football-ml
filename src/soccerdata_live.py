@@ -70,6 +70,11 @@ _DIRECT_HEADERS = {
 }
 
 
+# Used only to improve cross-provider player-name matching for the Premier League.
+# Failure is harmless: the merger falls back to the existing names.
+_FPL_NAME_CACHE: dict[int, set[str]] | None = None
+
+
 _CLUB_ALIASES = {
     "mancity": "manchestercity",
     "manchestercity": "manchestercity",
@@ -97,6 +102,139 @@ def canonical_club_key(value: object) -> str:
     key = normalize_club(value)
     return _CLUB_ALIASES.get(key, key)
 
+
+
+def _load_fpl_name_aliases() -> dict[int, set[str]]:
+    """Return FPL player-id -> conservative aliases from official bootstrap data.
+
+    The live player table intentionally displays FPL's short ``web_name``.
+    ESPN/Understat usually expose full names, so exact web_name matching misses
+    many legitimate rows. This helper keeps the UI name unchanged while adding
+    hidden aliases for matching.
+    """
+    global _FPL_NAME_CACHE
+    if _FPL_NAME_CACHE is not None:
+        return _FPL_NAME_CACHE
+
+    aliases: dict[int, set[str]] = {}
+    try:
+        response = requests.get(
+            "https://fantasy.premierleague.com/api/bootstrap-static/",
+            headers=_DIRECT_HEADERS,
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        for p in payload.get("elements", []) or []:
+            try:
+                pid = int(p.get("id"))
+            except Exception:
+                continue
+            first = str(p.get("first_name") or "").strip()
+            second = str(p.get("second_name") or "").strip()
+            web = str(p.get("web_name") or "").strip()
+
+            values = {
+                normalize_name(web),
+                normalize_name(f"{first} {second}".strip()),
+                normalize_name(second),
+            }
+            # Common cross-provider form: first initial + surname.
+            if first and second:
+                values.add(normalize_name(f"{first[0]} {second}"))
+            aliases[pid] = {v for v in values if len(v) >= 2}
+    except Exception:
+        aliases = {}
+
+    _FPL_NAME_CACHE = aliases
+    return aliases
+
+
+def _candidate_aliases_for_players(players: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    """Group live-player aliases by club for conservative provider matching."""
+    fpl_aliases = _load_fpl_name_aliases() if "player_id" in players.columns else {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+
+    for idx, row in players.iterrows():
+        club_key = canonical_club_key(row.get("club"))
+        if not club_key:
+            continue
+
+        aliases = {normalize_name(row.get("name"))}
+        try:
+            pid = int(row.get("player_id"))
+            aliases |= fpl_aliases.get(pid, set())
+        except Exception:
+            pass
+
+        aliases = {a for a in aliases if len(a) >= 2}
+        grouped.setdefault(club_key, []).append(
+            {
+                "idx": idx,
+                "live_name": str(row.get("name") or ""),
+                "position": str(row.get("position") or "").upper(),
+                "aliases": aliases,
+            }
+        )
+    return grouped
+
+
+def _align_external_player_names(external: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
+    """Rewrite external names to the live pool's display name when uniquely matched.
+
+    Match order:
+      1. exact alias match within the same club;
+      2. unique contained alias (e.g. Saka <-> Bukayo Saka);
+      3. optional position filter when the external source exposes a position.
+
+    Ambiguous matches are deliberately left untouched rather than guessing.
+    """
+    if external is None or external.empty or "name" not in external.columns:
+        return external.copy() if isinstance(external, pd.DataFrame) else pd.DataFrame()
+
+    result = _align_external_clubs(external, players)
+    grouped = _candidate_aliases_for_players(players)
+
+    for idx, row in result.iterrows():
+        ext_key = normalize_name(row.get("name"))
+        club_key = canonical_club_key(row.get("club"))
+        if not ext_key or not club_key:
+            continue
+
+        candidates = grouped.get(club_key, [])
+        if not candidates:
+            continue
+
+        ext_pos = str(row.get("position") or "").upper()
+        if ext_pos in {"GK", "DEF", "MID", "FWD"}:
+            positional = [c for c in candidates if c["position"] == ext_pos]
+            if positional:
+                candidates = positional
+
+        # Exact match against any official/display alias.
+        exact = [c for c in candidates if ext_key in c["aliases"]]
+        if len(exact) == 1:
+            result.at[idx, "name"] = exact[0]["live_name"]
+            continue
+
+        # Full providers commonly return "Bukayo Saka" while FPL displays "Saka".
+        # Require a reasonably informative alias and a UNIQUE player in the club.
+        contained = []
+        for candidate in candidates:
+            hit = False
+            for alias in candidate["aliases"]:
+                if len(alias) < 4:
+                    continue
+                if alias in ext_key or (len(ext_key) >= 4 and ext_key in alias):
+                    hit = True
+                    break
+            if hit:
+                contained.append(candidate)
+
+        if len(contained) == 1:
+            result.at[idx, "name"] = contained[0]["live_name"]
+
+    return result
 
 def _align_external_clubs(external: pd.DataFrame, players: pd.DataFrame) -> pd.DataFrame:
     """Rewrite external club labels to the live pool's label when keys clearly match."""
@@ -1032,7 +1170,7 @@ def _merge_understat(players: pd.DataFrame, stats: pd.DataFrame) -> tuple[pd.Dat
     if stats.empty:
         return players.copy(), 0
     result = players.copy()
-    right = _align_external_clubs(stats, players)
+    right = _align_external_player_names(stats, players)
     result["_name_key"] = result["name"].map(normalize_name)
     result["_club_key"] = result["club"].map(canonical_club_key)
     right["_name_key"] = right["name"].map(normalize_name)
@@ -1068,7 +1206,7 @@ def _merge_recent_espn(players: pd.DataFrame, recent: pd.DataFrame) -> tuple[pd.
         return players.copy(), 0
     from .lineup_intelligence import merge_recent_lineup_history
 
-    recent = _align_external_clubs(recent, players)
+    recent = _align_external_player_names(recent, players)
     result = merge_recent_lineup_history(players, recent)
     matched = int(pd.to_numeric(
         result.get("recent_lineup_matches", pd.Series(0.0, index=result.index)), errors="coerce"
