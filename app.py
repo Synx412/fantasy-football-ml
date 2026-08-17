@@ -653,10 +653,34 @@ def render_competition(
                     "lineup_consensus_probability", "lineup_source_count", "lineup_status",
                     "lineup_intelligence_note", "injury_reason", "next_opponent", "next_kickoff",
                 ]
+                availability_view = unavailable[
+                    [column for column in columns if column in unavailable.columns]
+                ].copy()
+
+                # Rank the availability feed by expected minutes, highest first.
+                # Appearance/start probability are used only as tie-breakers.
+                sort_columns = [
+                    column
+                    for column in [
+                        "expected_minutes_next",
+                        "appearance_probability",
+                        "start_probability",
+                    ]
+                    if column in availability_view.columns
+                ]
+                if sort_columns:
+                    availability_view = availability_view.sort_values(
+                        sort_columns,
+                        ascending=[False] * len(sort_columns),
+                        na_position="last",
+                    )
+
+                st.caption(
+                    "Ranked by expected minutes (highest first); appearance and start probability "
+                    "are used as tie-breakers."
+                )
                 st.dataframe(
-                    unavailable[[column for column in columns if column in unavailable.columns]].sort_values(
-                        "start_probability"
-                    ),
+                    availability_view,
                     use_container_width=True,
                     hide_index=True,
                 )
