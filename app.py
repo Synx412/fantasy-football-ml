@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from src.config import COMPETITIONS
@@ -73,6 +74,63 @@ def cached_confirmed_lineups(api_key: str, fixture_ids: tuple[int, ...]) -> pd.D
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_football_data_matches(token: str, competition_code: str, season: int) -> list[dict]:
     return fetch_football_data_matches(token, competition_code, season)
+
+
+@st.cache_data(ttl=55, show_spinner=False)
+def test_football_data_connection(token: str) -> dict:
+    """Make one lightweight authenticated request and expose rate-limit status."""
+    clean_token = str(token or "").strip()
+    if not clean_token:
+        return {"ok": False, "message": "No FOOTBALL_DATA_TOKEN is configured."}
+
+    try:
+        response = requests.get(
+            "https://api.football-data.org/v4/competitions/PL",
+            headers={
+                "X-Auth-Token": clean_token,
+                "User-Agent": "FantasyXI-ML/2.0",
+            },
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return {"ok": False, "message": f"Connection failed: {exc}"}
+
+    remaining = (
+        response.headers.get("X-Requests-Available-Minute")
+        or response.headers.get("X-RequestsAvailable")
+        or response.headers.get("X-Requests-Available")
+    )
+    reset_seconds = response.headers.get("X-RequestCounter-Reset")
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code == 200:
+        return {
+            "ok": True,
+            "status": response.status_code,
+            "competition": payload.get("name", "Premier League"),
+            "remaining": remaining,
+            "reset_seconds": reset_seconds,
+        }
+
+    message = (
+        payload.get("message")
+        or payload.get("error")
+        or response.reason
+        or "Unknown football-data.org error"
+    )
+    if response.status_code == 429:
+        message = f"Rate limit reached. {message}"
+    return {
+        "ok": False,
+        "status": response.status_code,
+        "message": str(message),
+        "remaining": remaining,
+        "reset_seconds": reset_seconds,
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -542,6 +600,25 @@ with st.sidebar:
         type="password",
         help="Optional second free fixture source. Store as FOOTBALL_DATA_TOKEN.",
     )
+    if st.button("Test football-data.org connection", use_container_width=True):
+        with st.spinner("Testing football-data.org..."):
+            test_result = test_football_data_connection(football_data_token)
+        if test_result.get("ok"):
+            details = [
+                f"Connected ✅ — {test_result.get('competition', 'football-data.org')}",
+            ]
+            if test_result.get("remaining") is not None:
+                details.append(f"requests remaining this minute: {test_result['remaining']}")
+            if test_result.get("reset_seconds") is not None:
+                details.append(f"counter reset: {test_result['reset_seconds']} s")
+            st.success(" · ".join(details))
+        else:
+            status = test_result.get("status")
+            status_text = f"HTTP {status}: " if status is not None else ""
+            st.error(f"football-data.org failed ❌ — {status_text}{test_result.get('message', 'Unknown error')}")
+            if test_result.get("reset_seconds") is not None:
+                st.caption(f"Counter reset: {test_result['reset_seconds']} seconds")
+    st.caption("The connection test uses one football-data.org request and is cached for about 55 seconds.")
     season = st.number_input("Season start year", min_value=2020, max_value=2035, value=2026, step=1)
     use_api_injury_backup = st.checkbox(
         "Second EPL injury feed",
