@@ -790,40 +790,9 @@ def _predict_players_legacy(
         values = _statistical_projection(current.loc[missing])
         means[missing], lowers[missing], uppers[missing] = values, 0.60 * values, 1.55 * values
 
-    # The original blended-feature ML prediction remains useful for its learned
-    # residual interval, but final xP now comes from the four-source late-fusion.
-    base_low_gap = np.maximum(means - lowers, 0.0)
-    base_high_gap = np.maximum(uppers - means, 0.0)
-    ensemble_lower = np.maximum(
-        source_ensemble - base_low_gap - 0.75 * source_disagreement, 0.0
-    )
-    ensemble_upper = np.maximum(
-        source_ensemble + base_high_gap + 0.75 * source_disagreement,
-        source_ensemble,
-    )
-
-    scenario_weight = current["_scenario_weight"].to_numpy(dtype=float)
-    current["_mean"] = source_ensemble * scenario_weight
-    current["_lower"] = ensemble_lower * scenario_weight
-    current["_upper"] = ensemble_upper * scenario_weight
-
-    # Keep source-specific xP visible in the PredictionResult dataframe for
-    # auditing/debugging even if app.py does not display these columns yet.
-    current["_xp_base"] = source_xp["base"] * scenario_weight
-    current["_xp_espn"] = np.where(
-        source_xp["w_espn"] > 0, source_xp["espn"] * scenario_weight, np.nan
-    )
-    current["_xp_understat"] = np.where(
-        source_xp["w_understat"] > 0, source_xp["understat"] * scenario_weight, np.nan
-    )
-    current["_xp_clubelo"] = np.where(
-        source_xp["w_clubelo"] > 0, source_xp["clubelo"] * scenario_weight, np.nan
-    )
-    current["_w_base"] = source_xp["w_base"]
-    current["_w_espn"] = source_xp["w_espn"]
-    current["_w_understat"] = source_xp["w_understat"]
-    current["_w_clubelo"] = source_xp["w_clubelo"]
-
+    current["_mean"] = means * current["_scenario_weight"]
+    current["_lower"] = lowers * current["_scenario_weight"]
+    current["_upper"] = uppers * current["_scenario_weight"]
     grouped = current.groupby("_source_index", sort=False)
     output = base.copy()
     output["predicted_points"] = grouped["_mean"].sum().reindex(output.index).fillna(0.0)
@@ -844,10 +813,6 @@ def _predict_players_legacy(
     output["expected_minutes_next"] = first["_expected_minutes"].reindex(output.index).fillna(0.0)
     output["expected_minutes"] = grouped["_expected_minutes"].sum().reindex(output.index).fillna(0.0)
     output["horizon_fixture_count"] = grouped["fixture_count"].sum().reindex(output.index).fillna(0.0)
-    output["xp_weight_base"] = first["_w_base"].reindex(output.index).fillna(1.0)
-    output["xp_weight_espn"] = first["_w_espn"].reindex(output.index).fillna(0.0)
-    output["xp_weight_understat"] = first["_w_understat"].reindex(output.index).fillna(0.0)
-    output["xp_weight_clubelo"] = first["_w_clubelo"].reindex(output.index).fillna(0.0)
 
     relative_interval = output["point_uncertainty"] / (output["predicted_points"] + 1.0)
     interval_confidence = 1.0 / (1.0 + relative_interval.clip(lower=0.0))
@@ -1718,9 +1683,44 @@ def predict_players(
         lowers[missing] = 0.60 * values
         uppers[missing] = 1.55 * values
 
-    current["_mean"] = means * current["_scenario_weight"]
-    current["_lower"] = lowers * current["_scenario_weight"]
-    current["_upper"] = uppers * current["_scenario_weight"]
+    # Final fantasy xP is now late-fused from four independent source views.
+    # The original ML interval is retained as a baseline and widened when the
+    # source-specific xP estimates disagree.
+    base_low_gap = np.maximum(means - lowers, 0.0)
+    base_high_gap = np.maximum(uppers - means, 0.0)
+    ensemble_lower = np.maximum(
+        source_ensemble - base_low_gap - 0.75 * source_disagreement, 0.0
+    )
+    ensemble_upper = np.maximum(
+        source_ensemble + base_high_gap + 0.75 * source_disagreement,
+        source_ensemble,
+    )
+
+    scenario_weight = current["_scenario_weight"].to_numpy(dtype=float)
+    current["_mean"] = source_ensemble * scenario_weight
+    current["_lower"] = ensemble_lower * scenario_weight
+    current["_upper"] = ensemble_upper * scenario_weight
+
+    # Persist each source's xP so the final result can be audited.
+    current["_xp_base"] = source_xp["base"] * scenario_weight
+    current["_xp_espn"] = np.where(
+        source_xp["w_espn"] > 0, source_xp["espn"] * scenario_weight, np.nan
+    )
+    current["_xp_understat"] = np.where(
+        source_xp["w_understat"] > 0,
+        source_xp["understat"] * scenario_weight,
+        np.nan,
+    )
+    current["_xp_clubelo"] = np.where(
+        source_xp["w_clubelo"] > 0,
+        source_xp["clubelo"] * scenario_weight,
+        np.nan,
+    )
+    current["_w_base"] = source_xp["w_base"]
+    current["_w_espn"] = source_xp["w_espn"]
+    current["_w_understat"] = source_xp["w_understat"]
+    current["_w_clubelo"] = source_xp["w_clubelo"]
+
     grouped = current.groupby("_source_index", sort=False)
     output = base.copy()
     output["predicted_points"] = grouped["_mean"].sum().reindex(output.index).fillna(0.0)
@@ -1755,6 +1755,10 @@ def predict_players(
     output["expected_minutes_next"] = first["_expected_minutes"].reindex(output.index).fillna(0.0)
     output["expected_minutes"] = grouped["_expected_minutes"].sum().reindex(output.index).fillna(0.0)
     output["horizon_fixture_count"] = grouped["fixture_count"].sum().reindex(output.index).fillna(0.0)
+    output["xp_weight_base"] = first["_w_base"].reindex(output.index).fillna(1.0)
+    output["xp_weight_espn"] = first["_w_espn"].reindex(output.index).fillna(0.0)
+    output["xp_weight_understat"] = first["_w_understat"].reindex(output.index).fillna(0.0)
+    output["xp_weight_clubelo"] = first["_w_clubelo"].reindex(output.index).fillna(0.0)
 
     relative_interval = output["point_uncertainty"] / (output["predicted_points"] + 1.0)
     interval_confidence = 1.0 / (1.0 + relative_interval.clip(lower=0.0))
