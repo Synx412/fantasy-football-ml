@@ -439,7 +439,7 @@ def _direct_espn_recent(
     if not league_id:
         raise SoccerDataError(f"No direct ESPN mapping for {competition}.")
 
-    base = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}"
+    base = f"http://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}"
 
     def completed_events_for_season(start_year: int) -> list[dict[str, Any]]:
         # ESPN exposes a season calendar from the July-1 scoreboard response.
@@ -584,28 +584,79 @@ def _direct_understat_players(competition: str, season: int) -> pd.DataFrame:
     if not slug:
         raise SoccerDataError(f"Understat direct fallback is not configured for {competition}.")
 
-    def fetch_year(year: int) -> dict[str, Any]:
-        url = f"https://understat.com/getLeagueData/{slug}/{year}"
-        return _direct_json(url)
+    # Understat's current JSON endpoints expect a normal session/cookies plus
+    # X-Requested-With. This mirrors the current SoccerData implementation.
+    session = requests.Session()
+    headers = dict(_DIRECT_HEADERS)
+    headers["X-Requested-With"] = "XMLHttpRequest"
 
-    data = fetch_year(int(season))
+    try:
+        home = session.get("https://understat.com", headers=_DIRECT_HEADERS, timeout=20)
+        home.raise_for_status()
+    except Exception as exc:
+        raise SoccerDataError(f"Understat homepage/cookie initialization failed: {exc}") from exc
+
+    def get_json_session(url: str) -> dict[str, Any]:
+        response = session.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json()
+
+    requested = int(season)
+    season_to_use = requested
+
+    # Discover seasons Understat actually exposes. At the opening of a season,
+    # the requested new season can lag behind on Understat, so use the latest
+    # available league season as a statistical prior instead of failing.
+    try:
+        stat_data = get_json_session("https://understat.com/getStatData")
+        available: list[int] = []
+        for item in stat_data.get("stat", []) or []:
+            if str(item.get("league", "")).replace(" ", "_") != slug:
+                continue
+            year = int(item.get("year"))
+            month = int(item.get("month"))
+            sid = year if month >= 7 else year - 1
+            available.append(sid)
+        available = sorted(set(available))
+        if available and requested not in available:
+            eligible = [x for x in available if x <= requested]
+            season_to_use = max(eligible) if eligible else max(available)
+    except Exception:
+        # Discovery is helpful but not mandatory. We still try requested season.
+        season_to_use = requested
+
+    def fetch_year(year: int) -> dict[str, Any]:
+        return get_json_session(f"https://understat.com/getLeagueData/{slug}/{year}")
+
+    try:
+        data = fetch_year(season_to_use)
+    except Exception as first_exc:
+        if season_to_use != requested:
+            raise SoccerDataError(
+                f"Understat direct fallback failed for latest available season "
+                f"{season_to_use}: {first_exc}"
+            ) from first_exc
+        # Last-resort previous-season prior.
+        try:
+            season_to_use = requested - 1
+            data = fetch_year(season_to_use)
+        except Exception as second_exc:
+            raise SoccerDataError(
+                f"Understat direct fallback failed for {requested} and {requested - 1}: "
+                f"{first_exc} | {second_exc}"
+            ) from second_exc
+
     players = data.get("players") or []
     if not players:
-        # At the very beginning of a season, use the previous season as a
-        # statistical prior rather than reporting a false connection failure.
-        data = fetch_year(int(season) - 1)
-        players = data.get("players") or []
-
-    if not players:
-        raise SoccerDataError("Understat direct fallback returned no player rows.")
+        raise SoccerDataError(
+            f"Understat returned no player rows for season {season_to_use}."
+        )
 
     rows: list[dict[str, Any]] = []
     for p in players:
         games = safe_float(p.get("games"), 0.0)
         minutes = safe_float(p.get("time"), 0.0)
         appearances = max(games, 0.0)
-        # League-level endpoint has no explicit starts. Estimate only for the
-        # base pool; ESPN recent lineups override this signal where available.
         starts_est = min(appearances, max(0.0, minutes / 75.0))
         team = str(p.get("team_title") or "")
         if "," in team:
@@ -628,8 +679,10 @@ def _direct_understat_players(competition: str, season: int) -> pd.DataFrame:
                 "xg_chain": safe_float(p.get("xGChain"), 0.0),
                 "xg_buildup": safe_float(p.get("xGBuildup"), 0.0),
                 "understat_matches": appearances,
+                "understat_season_used": season_to_use,
             }
         )
+
     out = pd.DataFrame(rows)
     out = out[out["name"].astype(str).str.len().gt(0)].reset_index(drop=True)
     if out.empty:
@@ -741,9 +794,15 @@ def _direct_clubelo(competition: str) -> pd.DataFrame:
     datestring = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     errors: list[str] = []
     content = None
-    for scheme in ("https", "http"):
+    for scheme in ("http", "https"):
         try:
-            content = _direct_text(f"{scheme}://api.clubelo.com/{datestring}")
+            response = requests.get(
+                f"{scheme}://api.clubelo.com/{datestring}",
+                headers=_DIRECT_HEADERS,
+                timeout=8,
+            )
+            response.raise_for_status()
+            content = response.text
             if content.strip():
                 break
         except Exception as exc:
@@ -874,7 +933,7 @@ def fetch_soccerdata_bundle(
         "SofaScore",
         sofa_call,
         lambda: _direct_sofascore(competition, season),
-        "league table/schedule data loaded",
+        "league table/schedule data loaded (optional source)",
     )
     if sofa_value is None:
         sofa_table, sofa_schedule = empty, empty
@@ -888,7 +947,7 @@ def fetch_soccerdata_bundle(
         "ClubElo",
         elo_call,
         lambda: _direct_clubelo(competition),
-        "current club Elo ratings loaded",
+        "current club Elo ratings loaded (optional source)",
     )
     if elo is None:
         elo = empty
