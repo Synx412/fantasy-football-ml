@@ -1269,6 +1269,7 @@ def _merge_club_strength(players: pd.DataFrame, bundle: SoccerDataBundle) -> tup
                 opponent = canonical_club_key(row.get("next_opponent"))
                 if opponent in lookup:
                     current_opp = safe_float(row.get("opponent_strength"), 0.5)
+                    result.at[idx, "clubelo_opponent_strength"] = lookup[opponent]
                     result.at[idx, "opponent_strength"] = float(
                         np.clip(0.85 * current_opp + 0.15 * lookup[opponent], 0.0, 1.0)
                     )
@@ -1276,8 +1277,23 @@ def _merge_club_strength(players: pd.DataFrame, bundle: SoccerDataBundle) -> tup
 
 
 def apply_soccerdata_bundle(players: pd.DataFrame, bundle: SoccerDataBundle) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Apply only successful sources; a failed scraper never blocks squad generation."""
-    result, understat_matches = _merge_understat(players, bundle.understat_players)
+    """Apply successful sources and preserve base-provider values for late-fusion xP."""
+    result = players.copy()
+
+    # Keep an untouched snapshot of the primary provider inputs. For Premier
+    # League this is Official FPL. These columns let model.py produce a genuine
+    # base-provider xP instead of only predicting from already blended features.
+    for column in [
+        "xg",
+        "xa",
+        "start_probability",
+        "team_strength",
+        "opponent_strength",
+    ]:
+        if column in result.columns and f"base_{column}" not in result.columns:
+            result[f"base_{column}"] = result[column]
+
+    result, understat_matches = _merge_understat(result, bundle.understat_players)
     # Team-match counts/strength first, then recent ESPN lineups. This preserves the
     # rotation correction instead of overwriting it with the season-level prior.
     result, sofa_matches, elo_matches = _merge_club_strength(result, bundle)
