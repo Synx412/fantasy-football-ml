@@ -15,6 +15,12 @@ from src.model import estimate_missing_prices_ml, predict_players
 from src.optimizer import OptimizerError, optimize_team
 from src.public_enrichment import merge_public_enrichment
 from src.lineup_intelligence import merge_confirmed_lineups, merge_lineup_consensus, merge_recent_lineup_history
+from src.soccerdata_live import (
+    SoccerDataError,
+    apply_soccerdata_bundle,
+    build_soccerdata_player_pool,
+    fetch_soccerdata_bundle,
+)
 from src.providers import (
     DataProviderError,
     apply_team_context,
@@ -74,6 +80,13 @@ def cached_confirmed_lineups(api_key: str, fixture_ids: tuple[int, ...]) -> pd.D
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_football_data_matches(token: str, competition_code: str, season: int) -> list[dict]:
     return fetch_football_data_matches(token, competition_code, season)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_soccerdata_bundle(competition: str, season: int, recent_matches: int):
+    # Scraped public sources are deliberately cached for 6 hours. A normal live-data
+    # refresh does not hammer ESPN/Understat/SofaScore/ClubElo.
+    return fetch_soccerdata_bundle(competition, season, recent_matches=recent_matches)
 
 
 @st.cache_data(ttl=55, show_spinner=False)
@@ -198,6 +211,8 @@ def render_competition(
     global_history: pd.DataFrame | None,
     use_api_injury_backup: bool,
     use_confirmed_lineups: bool,
+    use_soccerdata: bool,
+    soccerdata_recent_matches: int,
 ) -> None:
     config = COMPETITIONS[name]
     st.subheader(name)
@@ -205,7 +220,13 @@ def render_competition(
     top = st.columns(4)
     if name == "Premier League":
         source_options = ["Live official FPL", "Demo", "Upload player CSV"]
+    elif name in {"La Liga", "Bundesliga", "Serie A", "Ligue 1"}:
+        # Understat covers the domestic big-five leagues, so SoccerData can provide
+        # the free live player pool here.
+        source_options = ["Live SoccerData (free)", "Live API-Football", "Demo", "Upload player CSV"]
     else:
+        # Understat does not provide a dependable Champions League player pool.
+        # SoccerData can still enrich ESPN/SofaScore/ClubElo where available.
         source_options = ["Live API-Football", "Demo", "Upload player CSV"]
     source = top[0].selectbox("Player data", source_options, key=f"source_{config.key}")
     budget = top[1].number_input(
@@ -237,7 +258,7 @@ def render_competition(
     price_file = None
     if source == "Upload player CSV":
         uploaded_players = st.file_uploader("Upload player pool CSV", type=["csv"], key=f"players_{config.key}")
-    elif source == "Live API-Football":
+    elif source in {"Live API-Football", "Live SoccerData (free)"}:
         price_file = st.file_uploader(
             "Optional official fantasy prices (CSV: name, price)",
             type=["csv"],
@@ -295,6 +316,15 @@ def render_competition(
             fixture_rows = 0
             fixture_provider = "Provided CSV"
             api_fixtures_for_lineups: list[dict] = []
+            soccer_bundle = None
+            soccerdata_applied: dict[str, int] = {}
+
+            # Fetch each SoccerData source independently. Any failed scraper is recorded
+            # and shown to the user; successful sources are still used.
+            if use_soccerdata and source != "Demo":
+                soccer_bundle = cached_soccerdata_bundle(
+                    name, int(season), int(soccerdata_recent_matches)
+                )
 
             if source == "Live official FPL":
                 players = cached_fpl_players(int(horizon))
@@ -311,6 +341,36 @@ def render_competition(
                         api_fixtures_for_lineups = cached_fixtures(api_key, config.api_league_id, season)
                     except DataProviderError as exc:
                         st.warning(f"Confirmed-lineup fixture lookup failed: {exc}")
+
+            elif source == "Live SoccerData (free)":
+                if soccer_bundle is None:
+                    soccer_bundle = cached_soccerdata_bundle(
+                        name, int(season), int(soccerdata_recent_matches)
+                    )
+                players = build_soccerdata_player_pool(soccer_bundle)
+
+                # Prefer football-data.org for fixtures because the user's free token
+                # has explicit rate-limit headers and is already verified.
+                context = pd.DataFrame()
+                if football_data_token.strip():
+                    try:
+                        matches = cached_football_data_matches(
+                            football_data_token, config.football_data_code, season
+                        )
+                        fixture_rows = len(matches)
+                        context = build_football_data_context(matches, horizon=int(horizon))
+                        fixture_provider = "football-data.org"
+                    except DataProviderError as exc:
+                        st.warning(f"football-data.org fixture feed failed: {exc}")
+
+                if not context.empty:
+                    players = apply_team_context(players, context)
+                else:
+                    fixture_provider = "SoccerData / no verified fixture context"
+                    fixture_rows = len(soccer_bundle.sofascore_schedule)
+
+                if price_file is not None:
+                    players = merge_price_file(players, read_uploaded_csv(price_file))
 
             elif source == "Live API-Football":
                 if not api_key.strip():
@@ -367,6 +427,30 @@ def render_competition(
                 players = demo_players(name)
                 fixture_rows = int(horizon)
                 fixture_provider = "Demo scenarios"
+
+            # Automatic SoccerData enrichment is applied to every live/uploaded player
+            # pool when enabled. ESPN affects recent start probability, Understat xG/xA,
+            # SofaScore + ClubElo team/opponent strength.
+            if use_soccerdata and soccer_bundle is not None:
+                players, soccerdata_applied = apply_soccerdata_bundle(players, soccer_bundle)
+
+                with st.expander("SoccerData source status", expanded=True):
+                    st.caption(
+                        "Each source is independent. A red failure does not stop squad generation; "
+                        "successful sources are still applied and cached for 6 hours."
+                    )
+                    for source_name in ["ESPN", "Understat", "SofaScore", "ClubElo"]:
+                        info = soccer_bundle.status.get(source_name, {})
+                        matched = int(soccerdata_applied.get(source_name, 0))
+                        if info.get("ok"):
+                            st.success(
+                                f"{source_name} ✅ — {info.get('message', 'loaded')} · "
+                                f"matched/applied to {matched} player rows"
+                            )
+                        else:
+                            st.error(
+                                f"{source_name} ❌ — {info.get('message', 'unknown SoccerData failure')}"
+                            )
 
             if public_enrichment_file is not None:
                 players = merge_public_enrichment(players, read_uploaded_csv(public_enrichment_file))
@@ -452,8 +536,11 @@ def render_competition(
             f"{result.validation_minutes_mae:.1f}" if result.validation_minutes_mae is not None else "N/A",
         )
         second_metrics[2].metric("Eligible players", len(eligible))
+        soccer_used = [source for source, count in soccerdata_applied.items() if int(count) > 0]
+        soccer_text = ", ".join(soccer_used) if soccer_used else "not used"
         st.caption(
             f"Model: {result.model_detail} · Fixtures: {fixture_provider} · "
+            f"SoccerData actually used: {soccer_text} · "
             f"Refreshed {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
         )
 
@@ -539,6 +626,8 @@ def render_competition(
                 "recent_start_rate", "recent_lineup_matches",
                 "lineup_consensus_probability", "lineup_source_count", "lineup_status",
                 "lineup_intelligence_note", "injury_reason", "price_source",
+                "understat_xg", "understat_xa", "understat_matches",
+                "sofascore_strength", "clubelo_strength",
             ]
             st.dataframe(
                 rankings.sort_values("predicted_points", ascending=False)[
@@ -572,7 +661,7 @@ def render_competition(
                     hide_index=True,
                 )
 
-    except (DataProviderError, OptimizerError, ValueError, KeyError, FileNotFoundError) as exc:
+    except (DataProviderError, SoccerDataError, OptimizerError, ValueError, KeyError, FileNotFoundError) as exc:
         st.error(str(exc))
 
 
@@ -619,6 +708,28 @@ with st.sidebar:
             if test_result.get("reset_seconds") is not None:
                 st.caption(f"Counter reset: {test_result['reset_seconds']} seconds")
     st.caption("The connection test uses one football-data.org request and is cached for about 55 seconds.")
+
+    st.subheader("Free SoccerData enrichment")
+    use_soccerdata = st.checkbox(
+        "Use ESPN + Understat + SofaScore + ClubElo",
+        value=True,
+        help=(
+            "No API key required. ESPN supplies recent actual lineups; Understat supplies xG/xA; "
+            "SofaScore and ClubElo supply team-strength cross-checks. Every source reports success/failure separately."
+        ),
+    )
+    soccerdata_recent_matches = st.slider(
+        "Recent ESPN lineup sample", 3, 8, 5, 1,
+        help="Number of recent matchday-squad records blended into each player's start prior.",
+    )
+    if st.button("Refresh SoccerData sources", use_container_width=True):
+        cached_soccerdata_bundle.clear()
+        st.rerun()
+    st.caption(
+        "SoccerData scrapers are cached for 6 hours. Website changes can break an individual source; "
+        "the app will show that source as failed instead of crashing."
+    )
+
     season = st.number_input("Season start year", min_value=2020, max_value=2035, value=2026, step=1)
     use_api_injury_backup = st.checkbox(
         "Second EPL injury feed",
@@ -635,7 +746,14 @@ with st.sidebar:
     )
     st.caption("Player statistics cache for 6 hours; fixtures 30–60 minutes; confirmed lineups 3 minutes.")
     if st.button("Refresh live data now"):
-        st.cache_data.clear()
+        # Refresh fast-changing feeds only. Keep the expensive 6-hour player/SoccerData
+        # caches intact so one tap cannot hammer a free provider.
+        cached_fpl_players.clear()
+        cached_injuries.clear()
+        cached_fixtures.clear()
+        cached_confirmed_lineups.clear()
+        cached_football_data_matches.clear()
+        test_football_data_connection.clear()
         st.rerun()
 
     st.divider()
@@ -653,8 +771,9 @@ with st.sidebar:
     )
 
 st.info(
-    "Premier League live data works without a key. Other competitions use API-Football for player statistics; "
-    "football-data.org can supply fixtures. The app is for free fantasy analysis, not betting."
+    "Premier League uses official FPL. Other top-five leagues can now use free SoccerData/Understat for the "
+    "player pool, with ESPN recent lineups, SofaScore, ClubElo and football-data.org as independent inputs. "
+    "API-Football is optional. The app is for free fantasy analysis, not betting."
 )
 
 render_competition(
@@ -665,4 +784,6 @@ render_competition(
     global_history,
     use_api_injury_backup,
     use_confirmed_lineups,
+    use_soccerdata,
+    int(soccerdata_recent_matches),
 )
