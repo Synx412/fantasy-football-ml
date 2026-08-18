@@ -73,7 +73,7 @@ def test_model_artifacts(history: pd.DataFrame):
 
     pretrained = _pretrained_artifact_for(history)
     assert pretrained is not None, "Multitask artifact is incompatible with bundled v8 history"
-    assert pretrained.get("model_version") == "v8"
+    assert pretrained.get("model_version") in {"v8", "v8.1"}
     assert pretrained.get("training_season") == "2025-26"
     bundle = pretrained["bundle"]
     assert bundle.start_model is not None
@@ -84,7 +84,7 @@ def test_model_artifacts(history: pd.DataFrame):
     assert points is not None, "v8 point artifact failed to load"
     assert points.get("kind") == "fpl_points_v2"
     assert points.get("schema_version") == 1
-    assert points.get("model_version") == "v8"
+    assert points.get("model_version") == "v8.1"
     assert points.get("training_season") == "2025-26"
     assert set(points.get("models", {})) == {"GK", "DEF", "MID", "FWD"}
     features = set(points.get("features", []))
@@ -94,7 +94,8 @@ def test_model_artifacts(history: pd.DataFrame):
         "recoveries_per90", "tackles_per90",
     }
     assert required_v8_features.issubset(features)
-    assert 0.0 <= float(points.get("official_base_blend", -1.0)) <= 0.65
+    assert float(points.get("official_base_blend", -1.0)) == 0.0
+    assert points.get("official_prior_predeadline_validated") is False
     validation = points.get("validation", {})
     assert float(validation.get("model_only_mae", 99.0)) < 2.0
     assert np.isfinite(float(validation.get("model_only_mean_gw_spearman", np.nan)))
@@ -272,15 +273,17 @@ def test_v7_source_logic(bundle) -> None:
     assert np.allclose(weights, 1.0)
     assert np.isfinite(total).all()
 
-    # Official FPL xP may change BASE only. ESPN/Understat/ClubElo must remain independent.
+    # v8.1: historical Official-FPL xP timing was not trustworthy enough to
+    # calibrate a production prior, so changing ep_next must NOT change any
+    # source projection until a pre-deadline-validated artifact explicitly
+    # enables that prior.
     low = engineered.copy()
     high = engineered.copy()
     low["official_fpl_xp"] = 2.0
     high["official_fpl_xp"] = 6.0
     _, xp_low, _ = _four_source_point_ensemble(bundle, low)
     _, xp_high, _ = _four_source_point_ensemble(bundle, high)
-    assert not np.allclose(xp_low["base"], xp_high["base"])
-    for source in ["espn", "understat", "clubelo"]:
+    for source in ["base", "espn", "understat", "clubelo"]:
         assert np.allclose(xp_low[source], xp_high[source], equal_nan=True), source
 
     # Understat attacking data is not a goalkeeper fantasy signal.
@@ -306,9 +309,10 @@ def test_v7_source_logic(bundle) -> None:
     _, xp0, _ = _four_source_point_ensemble(bundle, dgw0)
     _, xp4, _ = _four_source_point_ensemble(bundle, dgw4)
     artifact = _load_point_v2_artifact()
-    blend = float(artifact.get("official_base_blend", 0.50))
+    blend = float(artifact.get("official_base_blend", 0.0))
     observed_delta = float(np.sum(xp4["base"]) - np.sum(xp0["base"]))
-    assert abs(observed_delta - blend * 4.0) < 1e-6
+    assert blend == 0.0
+    assert abs(observed_delta) < 1e-9
 
     # Official ep_next is next-GW only; future horizon rows remain model-only.
     horizon_low = _engineered_source_rows(_source_test_row("FWD"), [0, 1])
@@ -415,7 +419,7 @@ def main() -> None:
 
     result = predict_players(players, history, horizon=2)
     assert result.mode == "multitask_ml"
-    assert "v8" in result.model_detail.lower()
+    assert "v8.1" in result.model_detail.lower()
     assert "2025-26" in result.model_detail
     assert result.validation_mae is not None
     assert result.validation_start_brier is not None
@@ -463,11 +467,11 @@ def main() -> None:
             assert minimum <= count <= maximum
         print(f"{name}: valid risk-aware squad, cost={team.total_cost:.1f}, captain={team.captain}")
 
-    print("v8 source-logic invariants: PASS")
+    print("v8.1 source-logic invariants: PASS")
     print("pre-season context/denominator regressions: PASS")
     point_validation = _load_point_v2_artifact().get("validation", {})
     print(
-        "v8 point model held-out: "
+        "v8.1 point model held-out: "
         f"model-only MAE={point_validation.get('model_only_mae', float('nan')):.3f}, "
         f"mean-GW Spearman={point_validation.get('model_only_mean_gw_spearman', float('nan')):.3f}, "
         f"FPL/Base blend MAE={point_validation.get('base_fpl_50_50_single_fixture_mae', float('nan')):.3f}"
