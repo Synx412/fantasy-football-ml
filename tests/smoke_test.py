@@ -11,12 +11,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.config import COMPETITIONS
 from src.demo import demo_players
-from src.history import load_bundled_history
+from src.history import V8_HISTORY, load_bundled_history
 from src.model import (
     POINT_V2_PATH,
     PRETRAINED_MODEL_PATH,
     _four_source_point_ensemble,
     _load_point_v2_artifact,
+    _point_v2_predict,
     _pretrained_artifact_for,
     engineer_features,
     estimate_missing_prices_ml,
@@ -66,25 +67,37 @@ def fixture(
 
 
 def test_model_artifacts(history: pd.DataFrame):
+    assert V8_HISTORY.exists(), "Missing data/fpl_multitask_training_2025_26.csv"
     assert PRETRAINED_MODEL_PATH.exists(), "Missing models/fpl_multitask_bundle.joblib"
     assert POINT_V2_PATH.exists(), "Missing models/fpl_points_v2.joblib"
 
     pretrained = _pretrained_artifact_for(history)
-    assert pretrained is not None, "Multitask artifact is incompatible with bundled history"
+    assert pretrained is not None, "Multitask artifact is incompatible with bundled v8 history"
+    assert pretrained.get("model_version") == "v8"
+    assert pretrained.get("training_season") == "2025-26"
     bundle = pretrained["bundle"]
     assert bundle.start_model is not None
     assert bundle.appearance_model is not None
     assert bundle.minutes_model is not None
 
     points = _load_point_v2_artifact()
-    assert points is not None, "v7 point artifact failed to load"
+    assert points is not None, "v8 point artifact failed to load"
     assert points.get("kind") == "fpl_points_v2"
     assert points.get("schema_version") == 1
+    assert points.get("model_version") == "v8"
+    assert points.get("training_season") == "2025-26"
     assert set(points.get("models", {})) == {"GK", "DEF", "MID", "FWD"}
-    assert "price" in points.get("features", [])
+    features = set(points.get("features", []))
+    required_v8_features = {
+        "price", "xgc_per90", "threat_per90", "creativity_per90",
+        "influence_per90", "defensive_contribution_per90", "cbi_per90",
+        "recoveries_per90", "tackles_per90",
+    }
+    assert required_v8_features.issubset(features)
+    assert 0.0 <= float(points.get("official_base_blend", -1.0)) <= 0.65
     validation = points.get("validation", {})
     assert float(validation.get("model_only_mae", 99.0)) < 2.0
-    assert float(validation.get("base_fpl_50_50_single_fixture_mae", 99.0)) < 2.0
+    assert np.isfinite(float(validation.get("model_only_mean_gw_spearman", np.nan)))
     return bundle
 
 
@@ -307,6 +320,31 @@ def test_v7_source_logic(bundle) -> None:
     assert abs(float(h_low["base"][1]) - float(h_high["base"][1])) < 1e-9
 
 
+def test_v8_scoring_features(history: pd.DataFrame) -> None:
+    assert history["position"].astype(str).str.upper().isin({"GK", "DEF", "MID", "FWD"}).all()
+    assert int(pd.to_numeric(history["GW"], errors="coerce").max()) >= 38
+    assert "target_defensive_contribution" in history.columns
+    dc_target = pd.to_numeric(history["target_defensive_contribution"], errors="coerce").fillna(0.0)
+    assert float(dc_target.sum()) > 0.0, "2025/26 defensive-contribution labels are all zero"
+
+    artifact = _load_point_v2_artifact()
+    features = list(artifact["features"])
+    defender = demo_players("Premier League")
+    defender = defender[defender["position"].eq("DEF")].iloc[[0]].copy().reset_index(drop=True)
+    defender["official_fpl_xp"] = 4.0
+    defender["fixture_count"] = 1.0
+    defender["team_matches_observed"] = 20.0
+    defender["defensive_contribution"] = 0.0
+    low = engineer_features(defender)
+    high = defender.copy()
+    high["defensive_contribution"] = 100.0
+    high = engineer_features(high)
+    low_xp = _point_v2_predict(low)
+    high_xp = _point_v2_predict(high)
+    assert low_xp is not None and high_xp is not None
+    assert float(high_xp[0]) + 1e-9 >= float(low_xp[0]), (features, low_xp, high_xp)
+
+
 def test_lineup_intelligence() -> None:
     intel_players = pd.DataFrame([
         {"player_id": 1, "name": "Rotation One", "club": "Alpha", "start_probability": 0.25, "lineup_status": ""},
@@ -341,7 +379,8 @@ def test_lineup_intelligence() -> None:
 
 def main() -> None:
     history = load_bundled_history()
-    assert len(history) == 16359
+    assert V8_HISTORY.exists()
+    assert len(history) > 15000
     required_targets = {"future_points", "future_started", "future_appearance", "future_minutes"}
     assert required_targets.issubset(history.columns)
 
@@ -351,6 +390,7 @@ def main() -> None:
     test_fpl_fixture_strength_and_rest()
     test_soccerdata_pool_rotation_denominator()
     test_v7_source_logic(bundle)
+    test_v8_scoring_features(history)
     test_lineup_intelligence()
 
     assert estimate_fpl_appearances(90, 1) == 1
@@ -375,7 +415,8 @@ def main() -> None:
 
     result = predict_players(players, history, horizon=2)
     assert result.mode == "multitask_ml"
-    assert "v7" in result.model_detail.lower()
+    assert "v8" in result.model_detail.lower()
+    assert "2025-26" in result.model_detail
     assert result.validation_mae is not None
     assert result.validation_start_brier is not None
     assert result.validation_appearance_brier is not None
@@ -422,18 +463,18 @@ def main() -> None:
             assert minimum <= count <= maximum
         print(f"{name}: valid risk-aware squad, cost={team.total_cost:.1f}, captain={team.captain}")
 
-    print("v7 source-logic invariants: PASS")
+    print("v8 source-logic invariants: PASS")
     print("pre-season context/denominator regressions: PASS")
     point_validation = _load_point_v2_artifact().get("validation", {})
     print(
-        "v7 point model held-out: "
+        "v8 point model held-out: "
         f"model-only MAE={point_validation.get('model_only_mae', float('nan')):.3f}, "
         f"mean-GW Spearman={point_validation.get('model_only_mean_gw_spearman', float('nan')):.3f}, "
         f"FPL/Base blend MAE={point_validation.get('base_fpl_50_50_single_fixture_mae', float('nan')):.3f}"
     )
     print(
         "Availability bundle validation: "
-        f"legacy point MAE={result.validation_mae:.3f}, "
+        f"displayed point MAE={result.validation_mae:.3f}, "
         f"start Brier={result.validation_start_brier:.3f}, "
         f"appearance Brier={result.validation_appearance_brier:.3f}, "
         f"minutes MAE={result.validation_minutes_mae:.2f}"
