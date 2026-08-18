@@ -19,6 +19,7 @@ from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier, XGBRegressor
 
 from src.ensemble_models import BlendedClassifier, BlendedRegressor
+from src.preseason_prior import blend_preseason_role_prior
 
 
 NUMERIC_FEATURES = [
@@ -1778,6 +1779,13 @@ def _four_source_point_ensemble(
     base_view["minutes_per_appearance"] = np.clip(base_minutes, 0.0, 90.0)
     xp_base_model = _point_projection_for_source(
         bundle, base_view, base_start, base_app, base_minutes
+    )
+
+    xp_base_model = blend_preseason_role_prior(
+        base_view,
+        xp_base_model,
+        base_start,
+        base_app,
     )
 
     official_total = pd.to_numeric(
