@@ -425,6 +425,8 @@ def _fetch_understat(sd, league: str, season: int) -> pd.DataFrame:
                 "xg_chain": float(group["xg_chain"].sum()),
                 "xg_buildup": float(group["xg_buildup"].sum()),
                 "understat_matches": float(group["game_key"].nunique()),
+                "understat_season_used": int(season),
+                "understat_is_previous_season": False,
             }
         )
     return pd.DataFrame(rows)
@@ -511,6 +513,8 @@ def _fetch_espn_recent(sd, league: str, season: int, recent_matches: int) -> pd.
                 "recent_lineup_matches": float(len(recent)),
                 "recent_minutes": float(recent["minutes"].mean()),
                 "espn_recent_starts": float(recent["started"].sum()),
+                "espn_season_used": int(season),
+                "espn_is_previous_season": False,
             }
         )
     return pd.DataFrame(result_rows)
@@ -613,10 +617,13 @@ def _direct_espn_recent(
                 unique[eid] = event
         return list(unique.values())
 
-    events = completed_events_for_season(int(season))
+    requested_season = int(season)
+    season_used = requested_season
+    events = completed_events_for_season(requested_season)
     if not events:
         # Useful at the start of a new season before any league match has been played.
-        events = completed_events_for_season(int(season) - 1)
+        season_used = requested_season - 1
+        events = completed_events_for_season(season_used)
 
     if not events:
         raise SoccerDataError("ESPN direct fallback found no completed matches.")
@@ -712,6 +719,8 @@ def _direct_espn_recent(
                 "recent_lineup_matches": float(len(recent)),
                 "recent_minutes": float(recent["minutes"].mean()),
                 "espn_recent_starts": float(recent["started"].sum()),
+                "espn_season_used": int(season_used),
+                "espn_is_previous_season": bool(season_used != requested_season),
             }
         )
     return pd.DataFrame(result_rows)
@@ -818,6 +827,7 @@ def _direct_understat_players(competition: str, season: int) -> pd.DataFrame:
                 "xg_buildup": safe_float(p.get("xGBuildup"), 0.0),
                 "understat_matches": appearances,
                 "understat_season_used": season_to_use,
+                "understat_is_previous_season": bool(season_to_use != requested),
             }
         )
 
@@ -1183,20 +1193,26 @@ def _merge_understat(players: pd.DataFrame, stats: pd.DataFrame) -> tuple[pd.Dat
             continue
         external = right.loc[key]
         matched += 1
-        source = str(row.get("data_source") or "")
-        proxy_like = "API-Football" in source or "SoccerData" in source
-        for column in ["xg", "xa"]:
+        # IMPORTANT: keep Understat in its own statistical window.
+        # At season rollover FPL totals reset to zero while the Understat fallback
+        # can be the previous season. Blending raw totals from those two windows
+        # corrupts per-90 features (e.g. previous-season xG divided by 0/1 current
+        # season minutes). Preserve the source values separately instead.
+        for column in ["minutes", "goals", "assists", "shots", "xg", "xa"]:
             external_value = safe_float(external.get(column), np.nan)
-            if not np.isfinite(external_value):
-                continue
-            current = safe_float(row.get(column), 0.0)
-            if proxy_like or current <= 0:
-                result.at[idx, column] = external_value
-            else:
-                # Official FPL xG/xA remain primary; Understat is an independent cross-source check.
-                result.at[idx, column] = 0.80 * current + 0.20 * external_value
-            result.at[idx, f"understat_{column}"] = external_value
-        result.at[idx, "understat_matches"] = safe_float(external.get("understat_matches"), 0.0)
+            if np.isfinite(external_value):
+                result.at[idx, f"understat_{column}"] = external_value
+
+        result.at[idx, "understat_matches"] = safe_float(
+            external.get("understat_matches"), 0.0
+        )
+        if pd.notna(external.get("understat_season_used", np.nan)):
+            result.at[idx, "understat_season_used"] = safe_float(
+                external.get("understat_season_used"), np.nan
+            )
+        result.at[idx, "understat_is_previous_season"] = bool(
+            external.get("understat_is_previous_season", False)
+        )
         result.at[idx, "soccerdata_understat"] = True
     return result.drop(columns=["_name_key", "_club_key"]), matched
 
@@ -1207,6 +1223,18 @@ def _merge_recent_espn(players: pd.DataFrame, recent: pd.DataFrame) -> tuple[pd.
     from .lineup_intelligence import merge_recent_lineup_history
 
     recent = _align_external_player_names(recent, players)
+
+    # Keep freshness metadata before the generic lineup merge (which intentionally
+    # only copies lineup fields).
+    metadata: dict[tuple[str, str], tuple[float | None, bool]] = {}
+    for _, row in recent.iterrows():
+        key = (normalize_name(row.get("name")), canonical_club_key(row.get("club")))
+        season_value = safe_float(row.get("espn_season_used"), np.nan)
+        metadata[key] = (
+            season_value if np.isfinite(season_value) else None,
+            bool(row.get("espn_is_previous_season", False)),
+        )
+
     result = merge_recent_lineup_history(players, recent)
     matched = int(pd.to_numeric(
         result.get("recent_lineup_matches", pd.Series(0.0, index=result.index)), errors="coerce"
@@ -1216,6 +1244,15 @@ def _merge_recent_espn(players: pd.DataFrame, recent: pd.DataFrame) -> tuple[pd.
             result.get("recent_lineup_matches", pd.Series(0.0, index=result.index)), errors="coerce"
         ).fillna(0.0).gt(0)
         result.loc[signal, "soccerdata_espn"] = True
+
+        for idx, row in result.loc[signal].iterrows():
+            key = (normalize_name(row.get("name")), canonical_club_key(row.get("club")))
+            if key not in metadata:
+                continue
+            season_value, stale = metadata[key]
+            if season_value is not None:
+                result.at[idx, "espn_season_used"] = season_value
+            result.at[idx, "espn_is_previous_season"] = bool(stale)
     return result, matched
 
 
@@ -1258,6 +1295,14 @@ def _merge_club_strength(players: pd.DataFrame, bundle: SoccerDataBundle) -> tup
             # Convert raw Elo to within-source percentile. This keeps the feature in the model's 0..1 range.
             elo["elo_strength"] = elo["elo"].rank(pct=True).clip(0.0, 1.0)
             lookup = elo.drop_duplicates("_club_key", keep="last").set_index("_club_key")["elo_strength"].to_dict()
+            pool_strength_map: dict[str, float] = {}
+            for club_name in result.get("club", pd.Series(dtype=str)).dropna().astype(str).unique():
+                club_key = canonical_club_key(club_name)
+                if club_key in lookup:
+                    pool_strength_map[club_name] = float(lookup[club_key])
+            if pool_strength_map:
+                result["clubelo_strength_map"] = [pool_strength_map.copy() for _ in range(len(result))]
+
             for idx, row in result.iterrows():
                 key = canonical_club_key(row.get("club"))
                 if key in lookup:
