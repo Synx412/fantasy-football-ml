@@ -436,6 +436,7 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
         team_strength = safe_float(live_team.get("team_strength"), 0.5)
         expected_goals = safe_float(p.get("expected_goals"))
         expected_assists = safe_float(p.get("expected_assists"))
+        expected_goals_conceded = safe_float(p.get("expected_goals_conceded"))
 
         rows.append(
             {
@@ -458,6 +459,16 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
                 "red_cards": safe_float(p.get("red_cards")),
                 "xg": expected_goals,
                 "xa": expected_assists,
+                "xgc": expected_goals_conceded,
+                "threat": safe_float(p.get("threat")),
+                "creativity": safe_float(p.get("creativity")),
+                "influence": safe_float(p.get("influence")),
+                "defensive_contribution": safe_float(p.get("defensive_contribution")),
+                "clearances_blocks_interceptions": safe_float(
+                    p.get("clearances_blocks_interceptions")
+                ),
+                "recoveries": safe_float(p.get("recoveries")),
+                "tackles": safe_float(p.get("tackles")),
                 "form": safe_float(p.get("form")),
                 "total_points": safe_float(p.get("total_points")),
                 "official_fpl_xp": safe_float(p.get("ep_next"), np.nan),

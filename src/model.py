@@ -32,6 +32,14 @@ NUMERIC_FEATURES = [
     "form",
     "xg_per90",
     "xa_per90",
+    "xgc_per90",
+    "threat_per90",
+    "creativity_per90",
+    "influence_per90",
+    "defensive_contribution_per90",
+    "cbi_per90",
+    "recoveries_per90",
+    "tackles_per90",
     "cards_per90",
     "bonus_per90",
     "bps_per90",
@@ -133,6 +141,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         "form": 0.0,
         "xg": 0.0,
         "xa": 0.0,
+        "xgc": 0.0,
+        "threat": 0.0,
+        "creativity": 0.0,
+        "influence": 0.0,
+        "defensive_contribution": 0.0,
+        "clearances_blocks_interceptions": 0.0,
+        "recoveries": 0.0,
+        "tackles": 0.0,
         "yellow_cards": 0.0,
         "red_cards": 0.0,
         "bonus": 0.0,
@@ -199,6 +215,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     result["saves_per90"] = 90.0 * result["saves"] / minutes
     result["xg_per90"] = 90.0 * result["xg"] / minutes
     result["xa_per90"] = 90.0 * result["xa"] / minutes
+    result["xgc_per90"] = 90.0 * result["xgc"] / minutes
+    result["threat_per90"] = 90.0 * result["threat"] / minutes
+    result["creativity_per90"] = 90.0 * result["creativity"] / minutes
+    result["influence_per90"] = 90.0 * result["influence"] / minutes
+    result["defensive_contribution_per90"] = 90.0 * result["defensive_contribution"] / minutes
+    result["cbi_per90"] = 90.0 * result["clearances_blocks_interceptions"] / minutes
+    result["recoveries_per90"] = 90.0 * result["recoveries"] / minutes
+    result["tackles_per90"] = 90.0 * result["tackles"] / minutes
     result["cards_per90"] = 90.0 * (
         result["yellow_cards"] + 3.0 * result["red_cards"]
     ) / minutes
@@ -1585,6 +1609,14 @@ def _point_v2_frame(frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
         "form": 0.0,
         "xg_per90": 0.0,
         "xa_per90": 0.0,
+        "xgc_per90": 0.0,
+        "threat_per90": 0.0,
+        "creativity_per90": 0.0,
+        "influence_per90": 0.0,
+        "defensive_contribution_per90": 0.0,
+        "cbi_per90": 0.0,
+        "recoveries_per90": 0.0,
+        "tackles_per90": 0.0,
         "cards_per90": 0.0,
         "bonus_per90": 0.0,
         "bps_per90": 0.0,
@@ -1611,15 +1643,16 @@ def _point_v2_frame(frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
 
 
 def _point_v2_predict(frame: pd.DataFrame) -> Optional[np.ndarray]:
-    """Return v7 point predictions for Premier League source views.
+    """Return the installed FPL point-model predictions for Premier League source views.
 
-    The v7 model was trained without Official FPL ``ep_next`` as an input. Price,
-    pre-match opponent/team context and player rates are learned independently.
+    v8 artifacts are trained without Official FPL ``ep_next`` as an input; the
+    official number remains a separate Base-branch prior. Older schema-compatible
+    artifacts continue to load during migration.
     """
     artifact = _load_point_v2_artifact()
     if artifact is None:
         return None
-    # Keep non-PL modes on their existing model path. The v7 artifact is trained
+    # Keep non-PL modes on their existing model path. The FPL artifact is trained
     # specifically on FPL history and should not silently override other leagues.
     if "official_fpl_xp" not in frame.columns:
         return None
@@ -1646,7 +1679,7 @@ def _point_projection_for_source(
 ) -> np.ndarray:
     """Translate one source view into fantasy expected points.
 
-    Premier League rows use the v7 point model, which is independent of FPL
+    Premier League rows use the installed point model, which is independent of FPL
     ``ep_next`` and was trained with price + leakage-safe opponent context.
     Other leagues retain the existing bundle point models.
     """
@@ -2185,20 +2218,31 @@ def predict_players(
         0.0,
         1.0,
     )
-    output["prediction_mode"] = "v7 independent-source late-fusion xP"
+    point_artifact = _load_point_v2_artifact() or {}
+    point_version = str(point_artifact.get("model_version") or "v7")
+    training_season = str(point_artifact.get("training_season") or "legacy")
+    official_prior = float(np.clip(point_artifact.get("official_base_blend", 0.50), 0.0, 0.65))
+    output["prediction_mode"] = f"{point_version} independent-source late-fusion xP"
 
     detail = (
         f"{deployment_mode} availability ({', '.join(bundle.trained_availability) or 'fallback'}) + "
-        f"v7 PL point model (price + leakage-safe opponent context) + "
-        f"late-fusion xP: FPL/Base uses a 50% official-next-GW prior only; "
+        f"{point_version} PL point model ({training_season}; leakage-safe opponent context) + "
+        f"late-fusion xP: FPL/Base uses a {official_prior:.0%} official-next-GW prior only; "
         f"ESPN, Understat and ClubElo are independently source-conditioned; "
         f"Understat is disabled for GK and freshness-weighted elsewhere; "
         f"source-disagreement uncertainty; {horizon_mode}"
     )
+    point_validation = point_artifact.get("validation", {}) if isinstance(point_artifact, dict) else {}
+    displayed_point_mae = point_validation.get("model_only_mae", bundle.validation_mae)
+    try:
+        displayed_point_mae = float(displayed_point_mae) if displayed_point_mae is not None else None
+    except (TypeError, ValueError):
+        displayed_point_mae = bundle.validation_mae
+
     return PredictionResult(
         output,
         "multitask_ml",
-        bundle.validation_mae,
+        displayed_point_mae,
         bundle.training_rows,
         detail,
         bundle.validation_start_brier,
