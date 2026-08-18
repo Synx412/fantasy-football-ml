@@ -1123,9 +1123,27 @@ def build_soccerdata_player_pool(bundle: SoccerDataBundle) -> pd.DataFrame:
             "SoccerData cannot build a live player pool because Understat did not return player-match data. "
             "Use official FPL for Premier League, or Upload/Demo until Understat works for this competition."
         )
-    appearances = pd.to_numeric(src.get("appearances"), errors="coerce").fillna(0.0)
-    starts = pd.to_numeric(src.get("starts"), errors="coerce").fillna(0.0)
-    start_probability = (starts + 0.5) / (appearances.clip(lower=1.0) + 1.0)
+    def numeric_col(name: str, default: float = 0.0) -> pd.Series:
+        if name not in src.columns:
+            return pd.Series(default, index=src.index, dtype=float)
+        return pd.to_numeric(src[name], errors="coerce").fillna(default)
+
+    appearances = numeric_col("appearances")
+    starts = numeric_col("starts")
+
+    # Understat's player rows contain player appearances, but fantasy start
+    # probability is unconditional per TEAM match. Approximate each club's
+    # observed team-match count with the largest player-appearance count in the
+    # same Understat sample. A later football-data.org context merge will replace
+    # this with the exact team-match count when available.
+    club_keys = src["club"].map(canonical_club_key)
+    team_matches = appearances.groupby(club_keys).transform("max").clip(lower=0.0)
+    start_probability = pd.Series(
+        [estimate_start_probability(st, mt) for st, mt in zip(starts, team_matches)],
+        index=src.index,
+        dtype=float,
+    )
+
     out = pd.DataFrame(
         {
             "player_id": np.nan,
@@ -1133,20 +1151,20 @@ def build_soccerdata_player_pool(bundle: SoccerDataBundle) -> pd.DataFrame:
             "club": src["club"].astype(str),
             "position": src.get("position", "MID"),
             "price": np.nan,
-            "minutes": pd.to_numeric(src.get("minutes"), errors="coerce").fillna(0.0),
+            "minutes": numeric_col("minutes"),
             "appearances": appearances,
             "starts": starts,
             "start_probability": start_probability.clip(0.0, 1.0),
-            "team_matches_observed": appearances,
+            "team_matches_observed": team_matches,
             "rating": 6.0,
-            "goals": pd.to_numeric(src.get("goals"), errors="coerce").fillna(0.0),
-            "assists": pd.to_numeric(src.get("assists"), errors="coerce").fillna(0.0),
+            "goals": numeric_col("goals"),
+            "assists": numeric_col("assists"),
             "clean_sheets": 0.0,
             "saves": 0.0,
-            "yellow_cards": pd.to_numeric(src.get("yellow_cards"), errors="coerce").fillna(0.0),
-            "red_cards": pd.to_numeric(src.get("red_cards"), errors="coerce").fillna(0.0),
-            "xg": pd.to_numeric(src.get("xg"), errors="coerce").fillna(0.0),
-            "xa": pd.to_numeric(src.get("xa"), errors="coerce").fillna(0.0),
+            "yellow_cards": numeric_col("yellow_cards"),
+            "red_cards": numeric_col("red_cards"),
+            "xg": numeric_col("xg"),
+            "xa": numeric_col("xa"),
             "form": 0.0,
             "total_points": 0.0,
             "bonus": 0.0,
