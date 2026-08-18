@@ -286,6 +286,7 @@ def _fpl_fixture_context(
     bootstrap: dict,
     fixtures: list[dict],
     horizon: int = 1,
+    team_strength_context: Optional[dict[int, dict[str, float]]] = None,
 ) -> dict[int, dict[str, Any]]:
     team_names = {int(t["id"]): t.get("name", str(t["id"])) for t in bootstrap.get("teams", [])}
     events = bootstrap.get("events", [])
@@ -299,9 +300,28 @@ def _fpl_fixture_context(
         event_ids = [event for event in event_ids if event >= int(next_event)]
     event_ids = event_ids[: max(1, int(horizon))]
 
+    # Track the real interval between fixtures. This is future-proof for models
+    # trained with congestion/rest features and avoids hard-coding seven days.
+    last_completed: dict[int, datetime] = {}
+    for fixture in fixtures:
+        if not fixture.get("finished"):
+            continue
+        kickoff = _parse_datetime(fixture.get("kickoff_time"))
+        if kickoff is None:
+            continue
+        for key in ("team_h", "team_a"):
+            try:
+                tid = int(fixture.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if tid in team_names and (tid not in last_completed or kickoff > last_completed[tid]):
+                last_completed[tid] = kickoff
+
+    strength_context = team_strength_context or {}
     context: dict[int, dict[str, Any]] = {}
     for team_id in team_names:
         scenarios: list[dict[str, Any]] = []
+        previous_kickoff = last_completed.get(team_id)
         for period_index, event_id in enumerate(event_ids):
             team_fixtures = [
                 fixture
@@ -316,29 +336,40 @@ def _fpl_fixture_context(
             ):
                 is_home = fixture.get("team_h") == team_id
                 opponent_id = fixture.get("team_a") if is_home else fixture.get("team_h")
+                opponent_id = int(opponent_id) if opponent_id is not None else 0
+                difficulty = safe_float(
+                    fixture.get("team_h_difficulty" if is_home else "team_a_difficulty"),
+                    3.0,
+                )
+                # Keep Official FPL FDR as fixture_difficulty, but use the
+                # opponent's independent league-relative strength for
+                # opponent_strength. Deriving both from FDR double-counted the
+                # same signal and also mixed home advantage into opponent quality.
+                opponent_strength = safe_float(
+                    strength_context.get(opponent_id, {}).get("team_strength"),
+                    (difficulty - 1.0) / 4.0,
+                )
+                kickoff = _parse_datetime(fixture.get("kickoff_time"))
+                if kickoff is not None and previous_kickoff is not None:
+                    rest_days = (kickoff - previous_kickoff).total_seconds() / 86400.0
+                    rest_days = float(np.clip(rest_days, 2.0, 21.0))
+                else:
+                    rest_days = 7.0
                 scenarios.append(
                     {
-                        "fixture_difficulty": safe_float(
-                            fixture.get("team_h_difficulty" if is_home else "team_a_difficulty"),
-                            3.0,
-                        ),
+                        "fixture_difficulty": difficulty,
                         "home": 1.0 if is_home else 0.0,
-                        "opponent_strength": (
-                            safe_float(
-                                fixture.get("team_h_difficulty" if is_home else "team_a_difficulty"),
-                                3.0,
-                            )
-                            - 1.0
-                        )
-                        / 4.0,
-                        "next_opponent": team_names.get(int(opponent_id), str(opponent_id)),
+                        "opponent_strength": float(np.clip(opponent_strength, 0.0, 1.0)),
+                        "next_opponent": team_names.get(opponent_id, str(opponent_id)),
                         "next_kickoff": str(fixture.get("kickoff_time") or ""),
                         "fixture_count": 1.0,
-                        "rest_days": 7.0,
+                        "rest_days": rest_days,
                         "fixture_id": fixture.get("id"),
                         "period_index": period_index,
                     }
                 )
+                if kickoff is not None:
+                    previous_kickoff = kickoff
 
         if not scenarios:
             context[team_id] = {
@@ -362,6 +393,7 @@ def _fpl_fixture_context(
                 default="",
             ),
             "fixture_count": float(len(scenarios)),
+            "rest_days": first["rest_days"],
             "next_fixture_ids": [scenario["fixture_id"] for scenario in scenarios if scenario.get("fixture_id")],
             "fixture_scenarios": scenarios,
         }
@@ -373,9 +405,14 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
     fixtures_payload = _get_json(f"{FPL_BASE}/fixtures/")
     fixtures = fixtures_payload if isinstance(fixtures_payload, list) else []
     teams = {int(t["id"]): t for t in bootstrap.get("teams", [])}
-    fixture_context = _fpl_fixture_context(bootstrap, fixtures, horizon=horizon)
     observed_matches = fpl_team_matches_observed(bootstrap, fixtures)
     live_team_context = fpl_live_team_context(bootstrap, fixtures)
+    fixture_context = _fpl_fixture_context(
+        bootstrap,
+        fixtures,
+        horizon=horizon,
+        team_strength_context=live_team_context,
+    )
     rows: list[dict[str, Any]] = []
 
     for p in bootstrap.get("elements", []):
@@ -441,8 +478,11 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
                 "team_form_points": safe_float(live_team.get("team_form_points"), 1.5),
                 "team_attack_form": safe_float(live_team.get("team_attack_form"), 1.35),
                 "team_defence_form": safe_float(live_team.get("team_defence_form"), 1.35),
-                "opponent_strength": (safe_float(context.get("fixture_difficulty"), 3.0) - 1.0) / 4.0,
-                "rest_days": 7.0,
+                "opponent_strength": safe_float(
+                    context.get("opponent_strength"),
+                    (safe_float(context.get("fixture_difficulty"), 3.0) - 1.0) / 4.0,
+                ),
+                "rest_days": safe_float(context.get("rest_days"), 7.0),
                 "lineup_status": "",
                 "price_source": "Official FPL price",
                 "data_source": "Official FPL live API",
@@ -771,21 +811,40 @@ def build_team_context(
     raw_strength: dict[int, float] = {}
     summaries: dict[int, dict[str, float]] = {}
     for team_id in teams:
-        matches = sorted(completed.get(team_id, []), key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc))
+        matches = sorted(
+            completed.get(team_id, []),
+            key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc),
+        )
         recent = matches[-5:]
-        sample = recent or matches
-        games = max(len(sample), 1)
-        ppg = sum(m["points"] for m in sample) / games
-        gfpg = sum(m["gf"] for m in sample) / games
-        gapg = sum(m["ga"] for m in sample) / games
-        raw_strength[team_id] = 0.52 * (ppg / 3.0) + 0.28 * min(gfpg / 2.5, 1.0) + 0.20 * (1.0 - min(gapg / 2.5, 1.0))
+        if recent:
+            games = float(len(recent))
+            ppg = sum(m["points"] for m in recent) / games
+            gfpg = sum(m["gf"] for m in recent) / games
+            gapg = sum(m["ga"] for m in recent) / games
+            raw_strength[team_id] = (
+                0.52 * (ppg / 3.0)
+                + 0.28 * min(gfpg / 2.5, 1.0)
+                + 0.20 * (1.0 - min(gapg / 2.5, 1.0))
+            )
+        else:
+            # Before a league has played a match, unknown form is neutral. The
+            # previous implementation produced 0 PPG / 0 GF and normalized every
+            # club to strength 0, making every opening fixture look FDR 1.
+            ppg, gfpg, gapg = 1.5, 1.35, 1.35
+            raw_strength[team_id] = 0.5
         summaries[team_id] = {"ppg": ppg, "gfpg": gfpg, "gapg": gapg}
 
     values = list(raw_strength.values())
     min_strength = min(values) if values else 0.0
     max_strength = max(values) if values else 1.0
-    span = max(max_strength - min_strength, 1e-6)
-    normalized = {team_id: (value - min_strength) / span for team_id, value in raw_strength.items()}
+    if not values or abs(max_strength - min_strength) < 1e-9:
+        normalized = {team_id: 0.5 for team_id in teams}
+    else:
+        span = max_strength - min_strength
+        normalized = {
+            team_id: float(np.clip((value - min_strength) / span, 0.0, 1.0))
+            for team_id, value in raw_strength.items()
+        }
 
     rows: list[dict[str, Any]] = []
     for team_id, club in teams.items():

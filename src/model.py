@@ -170,10 +170,23 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         )
     )
 
+    # Historical training rows use team-match exposure in the legacy
+    # ``appearances`` column (normally a recent rolling window). Live providers,
+    # however, may expose true player appearances. Prefer an explicit
+    # team_matches_observed denominator when available so minutes/start features
+    # have the same meaning at training and inference time: expected minutes and
+    # starts per TEAM match, not per player appearance.
     appearances = result["appearances"].clip(lower=1.0)
+    exposure_matches = appearances.copy()
+    if "team_matches_observed" in df.columns:
+        team_matches = pd.to_numeric(df["team_matches_observed"], errors="coerce")
+        valid_team_matches = team_matches.notna() & team_matches.gt(0.0)
+        exposure_matches.loc[valid_team_matches] = team_matches.loc[valid_team_matches]
+    exposure_matches = exposure_matches.clip(lower=1.0)
+
     minutes = result["minutes"].clip(lower=1.0)
-    result["minutes_per_appearance"] = (result["minutes"] / appearances).clip(0.0, 90.0)
-    inferred_start = (result["starts"] / appearances).clip(0.0, 1.0)
+    result["minutes_per_appearance"] = (result["minutes"] / exposure_matches).clip(0.0, 90.0)
+    inferred_start = (result["starts"] / exposure_matches).clip(0.0, 1.0)
     if "start_probability" in df.columns:
         supplied = pd.to_numeric(df["start_probability"], errors="coerce")
         result["start_probability"] = supplied.fillna(inferred_start).clip(0.0, 1.0)
