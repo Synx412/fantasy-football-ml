@@ -96,6 +96,39 @@ def _team_match_evidence(frame: pd.DataFrame) -> np.ndarray:
         club_max = np.zeros(n, dtype=float)
 
     observed = np.where(np.isfinite(observed) & (observed >= 0.0), observed, club_max)
+
+    # FPL can briefly expose previous-season player totals while the new-season
+    # fixture list has zero completed matches. providers.py deliberately guards
+    # those stale totals by reporting team_matches_observed=38 so start-rate
+    # reconstruction does not become a fake 100%. That is correct for the
+    # availability fallback, but it must NOT be interpreted here as 38 matches
+    # of current-season evidence or the preseason prior decays to ~zero.
+    #
+    # At true preseason, providers.py also gives every team the neutral
+    # no-results context (1.5 PPG, 1.35 GF, 1.35 GA). Use that independent signal
+    # to identify rollover rows even when stale starts/appearances are large.
+    team_form = pd.to_numeric(
+        frame.get("team_form_points", pd.Series(1.5, index=frame.index)),
+        errors="coerce",
+    ).fillna(1.5).to_numpy(dtype=float)
+    attack_form = pd.to_numeric(
+        frame.get("team_attack_form", pd.Series(1.35, index=frame.index)),
+        errors="coerce",
+    ).fillna(1.35).to_numpy(dtype=float)
+    defence_form = pd.to_numeric(
+        frame.get("team_defence_form", pd.Series(1.35, index=frame.index)),
+        errors="coerce",
+    ).fillna(1.35).to_numpy(dtype=float)
+
+    neutral_no_results = (
+        np.isclose(team_form, 1.5, atol=1e-9)
+        & np.isclose(attack_form, 1.35, atol=1e-9)
+        & np.isclose(defence_form, 1.35, atol=1e-9)
+    )
+    stale_rollover_context = (observed >= 30.0) & neutral_no_results
+    observed[stale_rollover_context] = 0.0
+
+    # Keep the older low-appearance rollover guard as a second line of defence.
     if "appearances" in frame.columns:
         own_apps = pd.to_numeric(
             frame["appearances"], errors="coerce"
