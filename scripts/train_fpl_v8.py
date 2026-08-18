@@ -10,7 +10,7 @@ Streamlit app does not need a model-routing migration:
     models/fpl_v8_report.json
 
 The point artifact remains schema_version=1 for loader compatibility, but carries
-model_version='v8' and training_season='2025-26'.
+model_version='v8.1' and training_season='2025-26'.
 """
 
 from argparse import ArgumentParser
@@ -242,15 +242,17 @@ def train_point_artifact(frame: pd.DataFrame, heldout_start_gw: int) -> tuple[di
         raise RuntimeError("Point validation did not produce predictions for every held-out row.")
 
     model_metrics = metric_block(heldout, heldout["_model_xp"])
-    single = heldout[
-        heldout["future_fixture_count"].eq(1)
-        & heldout["official_xp"].notna()
-        & heldout["official_xp"].ge(0.0)
-    ].copy()
-    if len(single) < 300:
-        raise RuntimeError("Not enough held-out single-fixture rows with Official FPL xP.")
-    official_metrics = metric_block(single, single["official_xp"])
-    blend_weight, blend_metrics = choose_official_blend(single)
+    # Do NOT tune the live Official-FPL prior from Vaastav's historical ``xP``
+    # column. Those values are not guaranteed to be pre-deadline snapshots and
+    # therefore are not a trustworthy out-of-sample prior for deployment.  v8.1
+    # keeps Official FPL xP as an audit/display source only until we have a
+    # timestamped archive captured before each deadline.
+    blend_weight = 0.0
+    blend_metrics = model_metrics.copy()
+    official_metrics = {
+        "status": "not_used_for_weight_selection",
+        "reason": "historical xP timing is not guaranteed pre-deadline",
+    }
 
     # Final production models use all 2025/26 rows after the untouched validation.
     final_models: dict[str, XGBRegressor] = {}
@@ -286,20 +288,21 @@ def train_point_artifact(frame: pd.DataFrame, heldout_start_gw: int) -> tuple[di
     artifact = {
         "schema_version": 1,
         "kind": "fpl_points_v2",
-        "model_version": "v8",
+        "model_version": "v8.1",
         "features": POINT_FEATURES,
         "models": final_models,
         "official_base_blend": float(blend_weight),
+        "official_prior_predeadline_validated": False,
         "training_rows": int(len(frame)),
         "training_season": "2025-26",
         "validation": validation,
         "monotone_constraints": {key: int(value) for key, value in MONOTONE.items()},
         "scoring_era": "2025-26 defensive-contribution era",
         "notes": (
-            "v8: 2025/26 leakage-safe chronological training; Assistant Manager excluded; "
+            "v8.1: 2025/26 leakage-safe chronological training; Assistant Manager excluded; "
             "team-match exposure denominator; defensive contributions/CBI/recoveries/tackles, "
-            "ICT components and xGC included; Official FPL xP excluded from model features and "
-            "used only as a validation-selected Base-branch prior."
+            "ICT components and xGC included. Official FPL xP is excluded from model features "
+            "and receives zero production weight until pre-deadline historical snapshots are available."
         ),
     }
     return artifact, validation
@@ -340,7 +343,7 @@ def train_multitask_artifact(history: pd.DataFrame) -> tuple[dict, dict]:
 
     artifact = {
         "schema_version": 3,
-        "model_version": "v8",
+        "model_version": "v8.1",
         "training_season": "2025-26",
         "sklearn_version": sklearn.__version__,
         "xgboost_version": xgboost.__version__,
@@ -382,7 +385,7 @@ def main() -> None:
     joblib.dump(multitask_artifact, PRETRAINED_MODEL_PATH, compress=3)
 
     report = {
-        "model_version": "v8",
+        "model_version": "v8.1",
         "training_season": "2025-26",
         "point_model": point_validation,
         "availability_model": multitask_validation,
@@ -398,7 +401,7 @@ def main() -> None:
     print(f"Wrote {REPORT_OUT}")
     print("Point held-out MAE:", round(float(point_validation["model_only"]["mae"]), 4))
     print("Point held-out Spearman:", round(float(point_validation["model_only"]["mean_gw_spearman"]), 4))
-    print("Chosen Official-FPL Base weight:", round(float(point_artifact["official_base_blend"]), 3))
+    print("Official-FPL Base weight (v8.1 safe default):", round(float(point_artifact["official_base_blend"]), 3))
     print("Start Brier:", multitask_validation["start_brier"])
     print("Appearance Brier:", multitask_validation["appearance_brier"])
     print("Minutes MAE:", multitask_validation["minutes_mae"])
