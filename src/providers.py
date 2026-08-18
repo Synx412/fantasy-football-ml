@@ -200,6 +200,75 @@ def fpl_team_matches_observed(bootstrap: dict, fixtures: list[dict]) -> dict[int
     return completed
 
 
+
+def fpl_live_team_context(bootstrap: dict, fixtures: list[dict]) -> dict[int, dict[str, float]]:
+    """Build live team-strength/form features on the same scale used by v7 training.
+
+    Static FPL team-strength values are converted to a 0-1 league-relative percentile
+    instead of dividing by a fixed constant. Recent PPM/GF/GA use only completed
+    fixtures, so the live feature semantics match the leakage-safe historical model.
+    """
+    teams = bootstrap.get("teams", []) or []
+    team_ids = [int(team.get("id") or 0) for team in teams if int(team.get("id") or 0) > 0]
+    static_raw: dict[int, float] = {}
+    for team in teams:
+        team_id = int(team.get("id") or 0)
+        if team_id <= 0:
+            continue
+        static_raw[team_id] = float(np.mean([
+            safe_float(team.get("strength_overall_home"), 1000.0),
+            safe_float(team.get("strength_overall_away"), 1000.0),
+        ]))
+
+    if len(set(static_raw.values())) > 1:
+        ordered = pd.Series(static_raw, dtype=float)
+        ranks = ordered.rank(method="average", pct=True)
+        n = max(len(ordered), 2)
+        static_strength = {
+            int(team_id): float(np.clip((ranks.loc[team_id] - 1.0 / n) / (1.0 - 1.0 / n), 0.0, 1.0))
+            for team_id in ordered.index
+        }
+    else:
+        static_strength = {team_id: 0.5 for team_id in team_ids}
+
+    history: dict[int, list[tuple[float, float, float]]] = {team_id: [] for team_id in team_ids}
+    completed = [fixture for fixture in fixtures if fixture.get("finished")]
+    completed = sorted(
+        completed,
+        key=lambda fixture: _parse_datetime(fixture.get("kickoff_time"))
+        or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    for fixture in completed:
+        home = int(fixture.get("team_h") or 0)
+        away = int(fixture.get("team_a") or 0)
+        if home not in history or away not in history:
+            continue
+        home_goals = safe_float(fixture.get("team_h_score"), np.nan)
+        away_goals = safe_float(fixture.get("team_a_score"), np.nan)
+        if not np.isfinite(home_goals) or not np.isfinite(away_goals):
+            continue
+        home_points = 3.0 if home_goals > away_goals else 1.0 if home_goals == away_goals else 0.0
+        away_points = 3.0 if away_goals > home_goals else 1.0 if home_goals == away_goals else 0.0
+        history[home].append((home_points, home_goals, away_goals))
+        history[away].append((away_points, away_goals, home_goals))
+
+    context: dict[int, dict[str, float]] = {}
+    for team_id in team_ids:
+        recent = history.get(team_id, [])[-5:]
+        if recent:
+            ppm = float(np.mean([row[0] for row in recent]))
+            gf = float(np.mean([row[1] for row in recent]))
+            ga = float(np.mean([row[2] for row in recent]))
+        else:
+            ppm, gf, ga = 1.5, 1.35, 1.35
+        context[team_id] = {
+            "team_strength": static_strength.get(team_id, 0.5),
+            "team_form_points": ppm,
+            "team_attack_form": gf,
+            "team_defence_form": ga,
+        }
+    return context
+
 def _parse_datetime(value: object) -> Optional[datetime]:
     if not value:
         return None
@@ -306,6 +375,7 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
     teams = {int(t["id"]): t for t in bootstrap.get("teams", [])}
     fixture_context = _fpl_fixture_context(bootstrap, fixtures, horizon=horizon)
     observed_matches = fpl_team_matches_observed(bootstrap, fixtures)
+    live_team_context = fpl_live_team_context(bootstrap, fixtures)
     rows: list[dict[str, Any]] = []
 
     for p in bootstrap.get("elements", []):
@@ -325,11 +395,8 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
         if chance is None:
             chance = 100 if p.get("status") == "a" else 50
 
-        strength_values = [
-            safe_float(team.get("strength_overall_home"), 1000.0),
-            safe_float(team.get("strength_overall_away"), 1000.0),
-        ]
-        team_strength = float(np.mean(strength_values)) / 1500.0
+        live_team = live_team_context.get(team_id, {})
+        team_strength = safe_float(live_team.get("team_strength"), 0.5)
         expected_goals = safe_float(p.get("expected_goals"))
         expected_assists = safe_float(p.get("expected_assists"))
 
@@ -371,9 +438,9 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
                 "next_fixture_ids": context.get("next_fixture_ids", []),
                 "fixture_scenarios": context.get("fixture_scenarios", []),
                 "team_strength": team_strength,
-                "team_form_points": 1.5,
-                "team_attack_form": 1.35,
-                "team_defence_form": 1.35,
+                "team_form_points": safe_float(live_team.get("team_form_points"), 1.5),
+                "team_attack_form": safe_float(live_team.get("team_attack_form"), 1.35),
+                "team_defence_form": safe_float(live_team.get("team_defence_form"), 1.35),
                 "opponent_strength": (safe_float(context.get("fixture_difficulty"), 3.0) - 1.0) / 4.0,
                 "rest_days": 7.0,
                 "lineup_status": "",
