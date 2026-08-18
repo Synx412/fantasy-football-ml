@@ -1808,7 +1808,12 @@ def _four_source_point_ensemble(
 
     official_valid = np.isfinite(official) & (official >= 0.0)
     artifact = _load_point_v2_artifact()
-    official_blend = float(artifact.get("official_base_blend", 0.50)) if artifact else 0.50
+    # Historical Vaastav ``xP`` is not guaranteed to be a pre-deadline snapshot.
+    # Only permit a non-zero Official-FPL prior when the artifact explicitly says
+    # it was calibrated on timestamped pre-deadline forecasts. v8.1 therefore
+    # defaults to model-only Base xP instead of importing a possibly mis-timed prior.
+    prior_is_validated = bool(artifact.get("official_prior_predeadline_validated", False)) if artifact else False
+    official_blend = float(artifact.get("official_base_blend", 0.0)) if prior_is_validated else 0.0
     official_blend = float(np.clip(official_blend, 0.0, 0.65))
     xp_base = np.where(
         official_valid,
@@ -2221,7 +2226,8 @@ def predict_players(
     point_artifact = _load_point_v2_artifact() or {}
     point_version = str(point_artifact.get("model_version") or "v7")
     training_season = str(point_artifact.get("training_season") or "legacy")
-    official_prior = float(np.clip(point_artifact.get("official_base_blend", 0.50), 0.0, 0.65))
+    prior_is_validated = bool(point_artifact.get("official_prior_predeadline_validated", False))
+    official_prior = float(np.clip(point_artifact.get("official_base_blend", 0.0), 0.0, 0.65)) if prior_is_validated else 0.0
     output["prediction_mode"] = f"{point_version} independent-source late-fusion xP"
 
     detail = (
