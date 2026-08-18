@@ -63,6 +63,21 @@ _MODEL_LOCK = threading.Lock()
 PRETRAINED_MODEL_PATH = (
     Path(__file__).resolve().parents[1] / "models" / "fpl_multitask_bundle.joblib"
 )
+XP_CALIBRATOR_PATH = (
+    Path(__file__).resolve().parents[1] / "models" / "fpl_xp_calibrator.joblib"
+)
+
+XP_CALIBRATOR_FEATURES = [
+    "raw_xp",
+    "price",
+    "minutes_per_appearance", "start_probability",
+    "goals_per90", "assists_per90", "xg_per90", "xa_per90",
+    "form", "bonus_per90", "bps_per90", "ict_index",
+    "chance_playing", "fixture_difficulty", "home", "fixture_count",
+    "team_strength", "team_form_points", "team_attack_form", "team_defence_form",
+    "opponent_strength", "rest_days",
+    "is_gk", "is_def", "is_mid", "is_fwd",
+]
 
 
 @dataclass
@@ -387,6 +402,15 @@ def _expand_scenarios(players: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame
         for scenario in scenarios:
             record = row.to_dict()
             record.update(scenario)
+
+            # ClubElo was merged before fixture expansion. Resolve the actual
+            # scenario opponent here so double gameweeks and horizons >1 do not
+            # reuse the first opponent's Elo rating.
+            strength_map = row.get("clubelo_strength_map")
+            scenario_opponent = str(record.get("next_opponent") or "")
+            if isinstance(strength_map, dict) and scenario_opponent in strength_map:
+                record["clubelo_opponent_strength"] = float(strength_map.get(scenario_opponent))
+
             period = max(0, int(scenario.get("period_index", 0)))
             record["_source_index"] = source_index
             record["_period_index"] = period
@@ -1190,6 +1214,163 @@ def estimate_missing_prices_ml(
 
 
 
+
+@lru_cache(maxsize=1)
+def _load_xp_calibrator() -> Optional[dict[str, Any]]:
+    """Load the lightweight FPL xP residual calibrator if installed."""
+    if not XP_CALIBRATOR_PATH.exists():
+        return None
+    try:
+        artifact = joblib.load(XP_CALIBRATOR_PATH)
+    except Exception:
+        return None
+    if not isinstance(artifact, dict):
+        return None
+    if artifact.get("kind") != "fpl_xp_residual_calibrator":
+        return None
+    if artifact.get("schema_version") != 1:
+        return None
+    if artifact.get("model") is None:
+        return None
+    return artifact
+
+
+def _calibrator_frame(frame: pd.DataFrame, raw_xp: np.ndarray) -> pd.DataFrame:
+    """Build the exact leakage-safe feature view expected by the calibrator."""
+    view = frame.copy()
+    view["raw_xp"] = np.asarray(raw_xp, dtype=float)
+    defaults = {
+        "price": 5.5,
+        "minutes_per_appearance": 0.0,
+        "start_probability": 0.0,
+        "goals_per90": 0.0,
+        "assists_per90": 0.0,
+        "xg_per90": 0.0,
+        "xa_per90": 0.0,
+        "form": 0.0,
+        "bonus_per90": 0.0,
+        "bps_per90": 0.0,
+        "ict_index": 0.0,
+        "selected_by_percent": 0.0,
+        "chance_playing": 1.0,
+        "fixture_difficulty": 3.0,
+        "home": 0.5,
+        "fixture_count": 1.0,
+        "team_strength": 0.5,
+        "team_form_points": 1.5,
+        "team_attack_form": 1.35,
+        "team_defence_form": 1.35,
+        "opponent_strength": 0.5,
+        "rest_days": 7.0,
+        "is_gk": 0.0,
+        "is_def": 0.0,
+        "is_mid": 0.0,
+        "is_fwd": 0.0,
+    }
+    for column in XP_CALIBRATOR_FEATURES:
+        if column == "raw_xp":
+            continue
+        if column not in view.columns:
+            view[column] = defaults.get(column, 0.0)
+        view[column] = pd.to_numeric(view[column], errors="coerce").fillna(
+            defaults.get(column, 0.0)
+        )
+    view["raw_xp"] = pd.to_numeric(view["raw_xp"], errors="coerce").fillna(0.0)
+    return view[XP_CALIBRATOR_FEATURES]
+
+
+def _calibrate_xp(
+    raw_xp: np.ndarray,
+    frame: pd.DataFrame,
+    active: np.ndarray,
+) -> np.ndarray:
+    """Calibrate PL xP without affecting leagues that lack Official FPL xP.
+
+    The artifact predicts a residual around historical Official FPL expected
+    points. Corrections are deliberately capped so one calibration layer cannot
+    create a new extreme ranking by itself.
+    """
+    values = np.maximum(np.asarray(raw_xp, dtype=float), 0.0)
+    artifact = _load_xp_calibrator()
+    active = np.asarray(active, dtype=bool)
+    if artifact is None or not active.any():
+        return values
+    try:
+        features = _calibrator_frame(frame, values)
+        correction = np.asarray(artifact["model"].predict(features), dtype=float)
+        limit = float(artifact.get("correction_clip", 1.5))
+        correction = np.clip(correction, -limit, limit)
+        values[active] = np.maximum(values[active] + correction[active], 0.0)
+    except Exception:
+        # Prediction must remain fail-soft. The four-source model still works
+        # even if the optional calibrator artifact is missing/incompatible.
+        return np.maximum(np.asarray(raw_xp, dtype=float), 0.0)
+    return values
+
+
+def _calibrate_xp_gameweek(
+    raw_xp: np.ndarray,
+    frame: pd.DataFrame,
+    active: np.ndarray,
+) -> np.ndarray:
+    """Apply the FPL residual calibrator once per player/gameweek, not once per fixture.
+
+    Historical Official FPL ``xP`` is a gameweek total and is repeated on each
+    raw fixture row in double gameweeks. Calibrating each scenario separately
+    therefore double-counts the correction. This helper aggregates period-0
+    scenarios, applies one correction to the gameweek total, then distributes
+    that correction back across the scenarios in proportion to their raw xP.
+    Future horizon periods are intentionally left model-only because ``ep_next``
+    does not forecast them.
+    """
+    values = np.maximum(np.asarray(raw_xp, dtype=float), 0.0)
+    active = np.asarray(active, dtype=bool)
+    artifact = _load_xp_calibrator()
+    if artifact is None or not active.any():
+        return values
+
+    if "_source_index" not in frame.columns or "_period_index" not in frame.columns:
+        return _calibrate_xp(values, frame, active)
+
+    result = values.copy()
+    source_ids = pd.to_numeric(frame["_source_index"], errors="coerce")
+    periods = pd.to_numeric(frame["_period_index"], errors="coerce").fillna(0).astype(int)
+
+    matchup_columns = ["fixture_difficulty", "home", "opponent_strength", "rest_days"]
+
+    try:
+        for source_id in source_ids.dropna().unique():
+            mask = source_ids.eq(source_id) & periods.eq(0)
+            idxs = np.flatnonzero(mask.to_numpy())
+            if len(idxs) == 0 or not active[idxs].any():
+                continue
+
+            raw_total = float(np.sum(values[idxs]))
+            representative = frame.iloc[[idxs[0]]].copy()
+            representative["fixture_count"] = float(len(idxs))
+            for column in matchup_columns:
+                if column in frame.columns:
+                    representative[column] = pd.to_numeric(
+                        frame.iloc[idxs][column], errors="coerce"
+                    ).mean()
+
+            features = _calibrator_frame(representative, np.asarray([raw_total], dtype=float))
+            correction = float(artifact["model"].predict(features)[0])
+            limit = float(artifact.get("correction_clip", 1.5))
+            correction = float(np.clip(correction, -limit, limit))
+            calibrated_total = max(raw_total + correction, 0.0)
+
+            if raw_total > 1e-9:
+                shares = np.maximum(values[idxs], 0.0)
+                shares = shares / max(float(shares.sum()), 1e-9)
+            else:
+                shares = np.full(len(idxs), 1.0 / len(idxs), dtype=float)
+            result[idxs] = np.maximum(values[idxs] + (calibrated_total - raw_total) * shares, 0.0)
+    except Exception:
+        return values
+
+    return result
+
 def _restore_base_provider_features(frame: pd.DataFrame) -> pd.DataFrame:
     """Build the primary-provider view (Official FPL for Premier League).
 
@@ -1262,6 +1443,38 @@ def _availability_without_cross_source(
         )
 
     appearance = np.maximum(appearance, start)
+
+    # Predicted-lineup consensus is independent of FPL/ESPN/Understat/ClubElo,
+    # so every source xP should respect it. This keeps Total xP consistent with
+    # the displayed start probability. Do NOT treat ESPN recent_minutes as a
+    # separate lineup vote: merge_recent_lineup_history leaves source_count at 0.
+    if "lineup_consensus_probability" in frame.columns:
+        consensus = pd.to_numeric(
+            frame["lineup_consensus_probability"], errors="coerce"
+        ).to_numpy(dtype=float)
+        source_counts = pd.to_numeric(
+            frame.get("lineup_source_count", pd.Series(0.0, index=frame.index)),
+            errors="coerce",
+        ).fillna(0.0).to_numpy(dtype=float)
+        valid_consensus = np.isfinite(consensus) & (source_counts > 0.0)
+        consensus_weight = np.clip(0.15 + 0.10 * source_counts, 0.0, 0.75)
+        start[valid_consensus] = (
+            (1.0 - consensus_weight[valid_consensus]) * start[valid_consensus]
+            + consensus_weight[valid_consensus] * np.clip(consensus[valid_consensus], 0.0, 1.0)
+        )
+        appearance[valid_consensus] = np.maximum(
+            appearance[valid_consensus], start[valid_consensus]
+        )
+
+        if "lineup_expected_minutes" in frame.columns:
+            consensus_minutes = pd.to_numeric(
+                frame["lineup_expected_minutes"], errors="coerce"
+            ).to_numpy(dtype=float)
+            valid_minutes = valid_consensus & np.isfinite(consensus_minutes)
+            minutes[valid_minutes] = (
+                0.55 * np.clip(minutes[valid_minutes], 0.0, 90.0)
+                + 0.45 * np.clip(consensus_minutes[valid_minutes], 0.0, 90.0)
+            )
 
     # ESPN gets a genuinely separate availability/minutes signal.
     if use_espn and "recent_start_rate" in frame.columns:
@@ -1391,34 +1604,85 @@ def _four_source_point_ensemble(
     bundle: _ModelBundle,
     engineered: pd.DataFrame,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
-    """Produce separate source xP values, then late-fuse them.
+    """Produce source-specific fantasy xP and late-fuse them.
 
-    Full-confidence weights:
+    Premier League rows use Official FPL ``ep_next`` as the xP scale anchor
+    when available. ESPN/Understat/ClubElo keep their own model-derived deltas
+    relative to the base model, so every source can still move a player up or
+    down. A historical residual calibrator then corrects systematic xP bias.
+
+    Full-confidence reliability priors remain:
       Base/Official FPL 50%
       ESPN              20%
       Understat         20%
       ClubElo           10%
-
-    Source weights shrink automatically when a player has weak/no source data,
-    and all remaining weights are renormalized per player.
     """
     base = _restore_base_provider_features(engineered)
 
-    # 1) Base provider / Official FPL xP
+    # Base availability view.
     base_start, base_app, base_minutes = _availability_without_cross_source(
         bundle, base, use_espn=False
     )
-    xp_base = _point_projection_for_source(
-        bundle, base, base_start, base_app, base_minutes
+    base_view = base.copy()
+    base_view["start_probability"] = np.clip(base_start, 0.0, 1.0)
+    base_view["minutes_per_appearance"] = np.clip(base_minutes, 0.0, 90.0)
+    xp_base_model = _point_projection_for_source(
+        bundle, base_view, base_start, base_app, base_minutes
     )
 
-    # 2) ESPN xP: same football-performance base, ESPN supplies playing-time evidence.
+    # Official FPL expected points is a stronger calibrated anchor when the
+    # live PL feed exposes ep_next. Missing/non-PL rows simply use ML base xP.
+    official_total = pd.to_numeric(
+        engineered.get(
+            "official_fpl_xp",
+            pd.Series(np.nan, index=engineered.index),
+        ),
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    # FPL ep_next is a NEXT-GAMEWEEK total, not a per-fixture number and not a
+    # multi-week forecast. Allocate it across period-0 fixtures only. For a DGW,
+    # the base model's scenario xP determines the split while preserving the exact
+    # official total. Periods >0 fall back to the trained model instead of reusing
+    # ep_next and double-counting it.
+    official = np.full(len(engineered), np.nan, dtype=float)
+    if "_source_index" in engineered.columns and "_period_index" in engineered.columns:
+        source_ids = pd.to_numeric(engineered["_source_index"], errors="coerce")
+        periods = pd.to_numeric(engineered["_period_index"], errors="coerce").fillna(0).astype(int)
+        for source_id in source_ids.dropna().unique():
+            rows_mask = source_ids.eq(source_id) & periods.eq(0)
+            row_idx = np.flatnonzero(rows_mask.to_numpy())
+            if len(row_idx) == 0:
+                continue
+            totals = official_total[row_idx]
+            finite_totals = totals[np.isfinite(totals) & (totals >= 0.0)]
+            if len(finite_totals) == 0:
+                continue
+            total_xp = float(finite_totals[0])
+            shares = np.maximum(xp_base_model[row_idx], 0.05)
+            shares = shares / max(float(shares.sum()), 1e-9)
+            official[row_idx] = total_xp * shares
+    else:
+        official = official_total.copy()
+
+    official_valid = np.isfinite(official) & (official >= 0.0)
+    xp_base_raw = np.where(official_valid, official, xp_base_model)
+
+    # ESPN: recent actual lineups/minutes. Preserve its model delta relative to
+    # the base but transfer that delta onto the Official FPL scale when present.
     espn = base.copy()
     espn_start, espn_app, espn_minutes = _availability_without_cross_source(
         bundle, espn, use_espn=True
     )
-    xp_espn = _point_projection_for_source(
+    espn["start_probability"] = np.clip(espn_start, 0.0, 1.0)
+    espn["minutes_per_appearance"] = np.clip(espn_minutes, 0.0, 90.0)
+    xp_espn_model = _point_projection_for_source(
         bundle, espn, espn_start, espn_app, espn_minutes
+    )
+    xp_espn_raw = np.where(
+        official_valid,
+        np.maximum(official + np.clip(xp_espn_model - xp_base_model, -2.0, 2.0), 0.0),
+        xp_espn_model,
     )
     espn_sample = pd.to_numeric(
         engineered.get("recent_lineup_matches", pd.Series(0.0, index=engineered.index)),
@@ -1428,72 +1692,135 @@ def _four_source_point_ensemble(
         engineered.get("soccerdata_espn", pd.Series(False, index=engineered.index)),
         errors="coerce",
     ).fillna(0.0).to_numpy(dtype=float) > 0
-    espn_conf = np.clip(espn_sample / 5.0, 0.0, 1.0) * espn_present.astype(float)
+    espn_stale = pd.Series(
+        engineered.get("espn_is_previous_season", False), index=engineered.index
+    ).fillna(False).astype(bool).to_numpy()
+    espn_freshness = np.where(espn_stale, 0.50, 1.00)
+    espn_conf = (
+        np.clip(espn_sample / 5.0, 0.0, 1.0)
+        * espn_present.astype(float)
+        * espn_freshness
+    )
 
-    # 3) Understat xP: its xG/xA replace the base source xG/xA for this view.
+    # Understat: independent attacking evidence.
+    # Use Understat's OWN minutes as denominator. Never divide previous-season
+    # Understat totals by current-season FPL minutes, which can be zero at rollover.
     understat = base.copy()
     understat_present = pd.to_numeric(
         engineered.get("soccerdata_understat", pd.Series(False, index=engineered.index)),
         errors="coerce",
     ).fillna(0.0).to_numpy(dtype=float) > 0
-    minutes_den = pd.to_numeric(
-        understat.get("minutes", pd.Series(0.0, index=understat.index)),
+
+    understat_minutes = pd.to_numeric(
+        engineered.get(
+            "understat_minutes",
+            pd.Series(np.nan, index=engineered.index),
+        ),
         errors="coerce",
-    ).fillna(0.0).clip(lower=1.0)
+    )
+    understat_minutes_safe = understat_minutes.clip(lower=1.0)
 
     for total_col, per90_col, source_col in [
+        ("goals", "goals_per90", "understat_goals"),
+        ("assists", "assists_per90", "understat_assists"),
         ("xg", "xg_per90", "understat_xg"),
         ("xa", "xa_per90", "understat_xa"),
     ]:
         if source_col in engineered.columns:
             external = pd.to_numeric(engineered[source_col], errors="coerce")
-            valid = external.notna() & pd.Series(understat_present, index=understat.index)
+            valid = (
+                external.notna()
+                & understat_minutes.notna()
+                & understat_minutes.gt(0.0)
+                & pd.Series(understat_present, index=understat.index)
+            )
             understat.loc[valid, total_col] = external.loc[valid]
-            understat.loc[valid, per90_col] = 90.0 * external.loc[valid] / minutes_den.loc[valid]
+            understat.loc[valid, per90_col] = (
+                90.0 * external.loc[valid] / understat_minutes_safe.loc[valid]
+            )
 
-    xp_understat = _point_projection_for_source(
+    understat["start_probability"] = np.clip(base_start, 0.0, 1.0)
+    understat["minutes_per_appearance"] = np.clip(base_minutes, 0.0, 90.0)
+    xp_understat_model = _point_projection_for_source(
         bundle, understat, base_start, base_app, base_minutes
+    )
+    xp_understat_raw = np.where(
+        official_valid,
+        np.maximum(
+            official + np.clip(xp_understat_model - xp_base_model, -2.0, 2.0),
+            0.0,
+        ),
+        xp_understat_model,
     )
     understat_sample = pd.to_numeric(
         engineered.get("understat_matches", pd.Series(0.0, index=engineered.index)),
         errors="coerce",
     ).fillna(0.0).to_numpy(dtype=float)
+    understat_stale = pd.Series(
+        engineered.get("understat_is_previous_season", False), index=engineered.index
+    ).fillna(False).astype(bool).to_numpy()
+    understat_freshness = np.where(understat_stale, 0.50, 1.00)
     understat_conf = (
         np.clip(understat_sample / 10.0, 0.0, 1.0)
         * understat_present.astype(float)
+        * np.isfinite(understat_minutes.to_numpy(dtype=float)).astype(float)
+        * (understat_minutes.to_numpy(dtype=float) > 0.0).astype(float)
+        * understat_freshness
     )
 
-    # 4) ClubElo xP: raw team/opponent Elo percentiles replace the base matchup view.
+    # ClubElo: independent team/opponent strength view.
     elo = base.copy()
     elo_team = pd.to_numeric(
         engineered.get("clubelo_strength", pd.Series(np.nan, index=engineered.index)),
         errors="coerce",
     )
     elo_opp = pd.to_numeric(
-        engineered.get("clubelo_opponent_strength", pd.Series(np.nan, index=engineered.index)),
+        engineered.get(
+            "clubelo_opponent_strength",
+            pd.Series(np.nan, index=engineered.index),
+        ),
         errors="coerce",
     )
     team_valid = elo_team.notna()
     opp_valid = elo_opp.notna()
-    elo.loc[team_valid, "team_strength"] = elo_team.loc[team_valid].clip(0, 1)
-    elo.loc[opp_valid, "opponent_strength"] = elo_opp.loc[opp_valid].clip(0, 1)
-
-    xp_elo = _point_projection_for_source(
+    elo.loc[team_valid, "team_strength"] = elo_team.loc[team_valid].clip(0.0, 1.0)
+    elo.loc[opp_valid, "opponent_strength"] = elo_opp.loc[opp_valid].clip(0.0, 1.0)
+    # Historical opponent calibration uses difficulty = 1 + 4*opponent_strength.
+    # Keep those two features internally consistent for the ClubElo source view.
+    elo.loc[opp_valid, "fixture_difficulty"] = (
+        1.0 + 4.0 * elo_opp.loc[opp_valid].clip(0.0, 1.0)
+    ).clip(1.0, 5.0)
+    elo["start_probability"] = np.clip(base_start, 0.0, 1.0)
+    elo["minutes_per_appearance"] = np.clip(base_minutes, 0.0, 90.0)
+    xp_elo_model = _point_projection_for_source(
         bundle, elo, base_start, base_app, base_minutes
+    )
+    xp_elo_raw = np.where(
+        official_valid,
+        np.maximum(official + np.clip(xp_elo_model - xp_base_model, -2.0, 2.0), 0.0),
+        xp_elo_model,
     )
     elo_present = pd.to_numeric(
         engineered.get("soccerdata_clubelo", pd.Series(False, index=engineered.index)),
         errors="coerce",
     ).fillna(0.0).to_numpy(dtype=float) > 0
-    # Full confidence when both team and opponent Elo are known; reduced when only team is.
     elo_conf = elo_present.astype(float) * np.where(
         team_valid.to_numpy() & opp_valid.to_numpy(),
         1.0,
         np.where(team_valid.to_numpy(), 0.60, 0.0),
     )
 
-    # Reliability priors. These are deliberately conservative until we have
-    # historical source-aligned data to backtest learned stacking weights.
+    # Historical PL calibration. It is deliberately activated only where the
+    # Official FPL xP anchor exists. Non-PL leagues keep the original ML path.
+    xp_base = _calibrate_xp_gameweek(xp_base_raw, base_view, official_valid)
+    xp_espn = _calibrate_xp_gameweek(xp_espn_raw, espn, official_valid & espn_present)
+    xp_understat = _calibrate_xp_gameweek(
+        xp_understat_raw, understat, official_valid & understat_present
+    )
+    xp_elo = _calibrate_xp_gameweek(xp_elo_raw, elo, official_valid & elo_present)
+
+    # Per-player reliability weights. Missing sources contribute zero weight and
+    # remaining sources are automatically renormalized.
     w_base = np.ones(len(engineered), dtype=float) * 1.00
     w_espn = 0.40 * espn_conf
     w_understat = 0.40 * understat_conf
@@ -1507,7 +1834,6 @@ def _four_source_point_ensemble(
         + w_elo * xp_elo
     ) / np.maximum(denominator, 1e-9)
 
-    # Weighted source disagreement becomes an uncertainty signal.
     variance = (
         w_base * (xp_base - ensemble) ** 2
         + w_espn * (xp_espn - ensemble) ** 2
@@ -1778,8 +2104,8 @@ def predict_players(
         f"({', '.join(bundle.trained_availability) or 'fallback'}) + "
         f"position starter/substitute point models for "
         f"{', '.join(trained_positions) or 'none'} + late-fusion xP "
-        f"(base provider/FPL + ESPN + Understat + ClubElo; adaptive per-player weights) "
-        f"with source-disagreement uncertainty; {horizon_mode}"
+        f"(FPL next-GW anchor + lineup consensus + ESPN/Understat freshness guards + scenario-specific ClubElo; adaptive weights) "
+        f"+ gameweek-level historical xP residual calibration + source-disagreement uncertainty; {horizon_mode}"
     )
     return PredictionResult(
         output,

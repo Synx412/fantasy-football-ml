@@ -356,6 +356,7 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
                 "xa": expected_assists,
                 "form": safe_float(p.get("form")),
                 "total_points": safe_float(p.get("total_points")),
+                "official_fpl_xp": safe_float(p.get("ep_next"), np.nan),
                 "bonus": safe_float(p.get("bonus")),
                 "bps": safe_float(p.get("bps")),
                 "ict_index": safe_float(p.get("ict_index")),
