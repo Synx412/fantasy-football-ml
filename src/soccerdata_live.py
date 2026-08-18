@@ -1038,16 +1038,16 @@ def fetch_soccerdata_bundle(
             for source in ["ESPN", "Understat", "SofaScore", "ClubElo"]
         })
 
-    # Import failure should not disable direct fallbacks.
-    try:
-        sd = _load_soccerdata()
-        sd_error = None
-    except SoccerDataError as exc:
-        sd = None
-        sd_error = str(exc)
+    # Streamlit Community Cloud has a read-only Python environment. SoccerData
+    # 1.9.1 may try to download a native TLS client into site-packages, which
+    # raises PermissionError and adds startup noise/delay. Our direct ESPN,
+    # Understat, SofaScore and ClubElo routes do not need that native library,
+    # so deployed predictions use the direct routes immediately.
+    sd = None
+    sd_error = "Native SoccerData TLS path skipped on deployment; using direct source routes."
 
     def unavailable():
-        raise SoccerDataError(sd_error or "SoccerData import is unavailable.")
+        raise SoccerDataError(sd_error)
 
     understat_call = (
         (lambda: _fetch_understat(sd, league, season)) if sd is not None else unavailable
