@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from datetime import timedelta
 
@@ -304,6 +305,33 @@ def _pick_column(frame: pd.DataFrame, *candidates: str) -> str | None:
 
 def _position_group(value: object) -> str:
     text = str(value or "").strip().lower()
+    upper = str(value or "").strip().upper()
+
+    # Understat's league-level player endpoint returns every role a player used
+    # during the season, for example ``F M S`` or ``D F M S``.  Those are not
+    # ordered by primary position.  Treating the first letter as authoritative
+    # incorrectly made attacking midfielders forwards and versatile midfielders
+    # defenders, which also sent them through the wrong position-specific point
+    # model.  A mixed outfield role is safest and most fantasy-like as MID;
+    # single-role values retain their natural group.  ``S`` only means the
+    # player was also used as a substitute and is not a playing position.
+    role_tokens = {
+        token
+        for token in re.split(r"[\s,;/|]+", upper)
+        if token
+    }
+    if role_tokens and role_tokens.issubset({"GK", "D", "M", "F", "S"}):
+        playing_roles = role_tokens - {"S"}
+        if "GK" in playing_roles:
+            return "GK"
+        if len(playing_roles) > 1 or "M" in playing_roles:
+            return "MID"
+        if "F" in playing_roles:
+            return "FWD"
+        if "D" in playing_roles:
+            return "DEF"
+        return "MID"
+
     if text in {"gk", "goalkeeper"} or "goalkeeper" in text:
         return "GK"
     if text in {"sub", "substitute"}:
@@ -315,7 +343,6 @@ def _position_group(value: object) -> str:
     if any(token in text for token in ["midfield", "midfielder", "dm", "cm", "am", "ml", "mr", "mc"]):
         return "MID"
     # Understat position codes often look like FW, AMR, AML, MC, DC, GK.
-    upper = str(value or "").upper()
     if "GK" in upper:
         return "GK"
     if upper.startswith("D"):
@@ -323,6 +350,99 @@ def _position_group(value: object) -> str:
     if upper.startswith("F"):
         return "FWD"
     return "MID"
+
+
+def _espn_position_group(value: object) -> str:
+    """Normalize ESPN's formation position without guessing from bench labels."""
+    if isinstance(value, dict):
+        candidates = [
+            value.get("displayName"),
+            value.get("name"),
+            value.get("abbreviation"),
+        ]
+    else:
+        candidates = [value]
+
+    abbreviation_map = {
+        "G": "GK",
+        "GK": "GK",
+        "D": "DEF",
+        "CD": "DEF",
+        "CB": "DEF",
+        "LD": "DEF",
+        "RD": "DEF",
+        "LB": "DEF",
+        "RB": "DEF",
+        "LWB": "DEF",
+        "RWB": "DEF",
+        "SW": "DEF",
+        "M": "MID",
+        "CM": "MID",
+        "DM": "MID",
+        "AM": "MID",
+        "LM": "MID",
+        "RM": "MID",
+        # Under FPL-style scoring, wide attackers use the midfield bucket.
+        "LW": "MID",
+        "RW": "MID",
+        "F": "FWD",
+        "CF": "FWD",
+        "ST": "FWD",
+        "FW": "FWD",
+        "LF": "FWD",
+        "RF": "FWD",
+    }
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if "substitut" in lowered or lowered in {"sub", "s", "bench", "reserve"}:
+            continue
+        compact = re.sub(r"[^A-Z]", "", text.upper())
+        if compact in abbreviation_map:
+            return abbreviation_map[compact]
+        if "goalkeeper" in lowered or lowered in {"goalie", "keeper"}:
+            return "GK"
+        if any(token in lowered for token in ["wing back", "wingback", "fullback", "defender", "sweeper"]):
+            return "DEF"
+        if "midfield" in lowered:
+            return "MID"
+        if lowered.endswith(" wing") or lowered in {"left wing", "right wing", "winger"}:
+            return "MID"
+        if any(token in lowered for token in ["forward", "striker", "attacker"]):
+            return "FWD"
+
+        position = _position_group(text)
+        if position in {"GK", "DEF", "MID", "FWD"}:
+            return position
+    return ""
+
+
+def _dominant_espn_position(frame: pd.DataFrame) -> str:
+    """Choose a stable scoring role, weighted mainly by minutes actually played."""
+    if frame.empty or "position" not in frame.columns:
+        return ""
+    valid = frame.copy()
+    valid["position"] = valid["position"].fillna("").astype(str).str.upper()
+    valid = valid[valid["position"].isin({"GK", "DEF", "MID", "FWD"})].copy()
+    if valid.empty:
+        return ""
+
+    minutes = pd.to_numeric(valid.get("minutes", 0.0), errors="coerce").fillna(0.0).clip(0.0, 90.0)
+    starts = pd.to_numeric(valid.get("started", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    # One point keeps unused substitutes informative; minutes and starts make
+    # actual on-pitch roles dominate repeated bench listings.
+    valid["_position_weight"] = 1.0 + minutes + 5.0 * starts
+    scores = valid.groupby("position", sort=False)["_position_weight"].sum()
+    best_score = float(scores.max())
+    candidates = set(scores[np.isclose(scores, best_score)].index.astype(str))
+    # The rows are chronological in both ESPN paths, so a genuine tie uses the
+    # most recently observed role rather than an arbitrary alphabetical one.
+    for position in reversed(valid["position"].tolist()):
+        if position in candidates:
+            return position
+    return ""
 
 
 def _parse_minute(value: object, default: float | None = None) -> float | None:
@@ -495,6 +615,7 @@ def _fetch_espn_recent(sd, league: str, season: int, recent_matches: int) -> pd.
                 "game_key": str(row.get(game_col, "")) if game_col else "",
                 "started": float(starter),
                 "minutes": minutes,
+                "position": _espn_position_group(position_text),
             }
         )
     lineup = pd.DataFrame(rows)
@@ -513,6 +634,7 @@ def _fetch_espn_recent(sd, league: str, season: int, recent_matches: int) -> pd.
                 "recent_lineup_matches": float(len(recent)),
                 "recent_minutes": float(recent["minutes"].mean()),
                 "espn_recent_starts": float(recent["started"].sum()),
+                "espn_position": _dominant_espn_position(recent),
                 "espn_season_used": int(season),
                 "espn_is_previous_season": False,
             }
@@ -581,7 +703,9 @@ def _direct_espn_recent(
     if not league_id:
         raise SoccerDataError(f"No direct ESPN mapping for {competition}.")
 
-    base = f"http://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}"
+    base = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_id}"
+    requested_season = int(season)
+    recent_limit = max(1, int(recent_matches))
 
     def completed_events_for_season(start_year: int) -> list[dict[str, Any]]:
         # ESPN exposes a season calendar from the July-1 scoreboard response.
@@ -602,9 +726,17 @@ def _direct_espn_recent(
         # Recent match dates only. 10 dates is normally several matchweeks and
         # avoids dozens of unnecessary requests.
         dates = sorted(dates)[-10:]
+        def scoreboard_for_date(dt: datetime) -> dict[str, Any]:
+            try:
+                return _direct_json(f"{base}/scoreboard?dates={dt.strftime('%Y%m%d')}")
+            except Exception:
+                return {}
+
         events: list[dict[str, Any]] = []
-        for dt in dates:
-            payload = _direct_json(f"{base}/scoreboard?dates={dt.strftime('%Y%m%d')}")
+        workers = min(6, max(1, len(dates)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            payloads = list(executor.map(scoreboard_for_date, dates))
+        for payload in payloads:
             for event in payload.get("events", []) or []:
                 status = ((event.get("status") or {}).get("type") or {})
                 if bool(status.get("completed")) or str(status.get("state", "")).lower() == "post":
@@ -617,100 +749,218 @@ def _direct_espn_recent(
                 unique[eid] = event
         return list(unique.values())
 
-    requested_season = int(season)
-    season_used = requested_season
-    events = completed_events_for_season(requested_season)
-    if not events:
-        # Useful at the start of a new season before any league match has been played.
-        season_used = requested_season - 1
-        events = completed_events_for_season(season_used)
+    def event_club_keys(event: dict[str, Any]) -> set[str]:
+        keys: set[str] = set()
+        for competition_block in event.get("competitions", []) or []:
+            for competitor in competition_block.get("competitors", []) or []:
+                team = competitor.get("team") or {}
+                name = (
+                    team.get("displayName")
+                    or team.get("shortDisplayName")
+                    or team.get("name")
+                )
+                key = canonical_club_key(name)
+                if key:
+                    keys.add(key)
+        return keys
 
-    if not events:
-        raise SoccerDataError("ESPN direct fallback found no completed matches.")
-
-    # Cap summary calls to keep Streamlit fast. Newest matches have priority.
-    events = events[: min(36, max(12, int(recent_matches) * 8))]
-    rows: list[dict[str, Any]] = []
-
-    for event in events:
-        event_id = str(event.get("id", ""))
-        if not event_id:
-            continue
+    def current_club_keys() -> set[str]:
+        """Return current league members, including clubs whose opener is postponed."""
         try:
-            data = _direct_json(f"{base}/summary?event={event_id}")
+            payload = _direct_json(
+                f"{base}/teams?limit=100&season={requested_season}"
+            )
         except Exception:
-            continue
+            return set()
 
-        rosters = data.get("rosters") or []
-        box_form = ((data.get("boxscore") or {}).get("form") or [])
-        event_date = pd.to_datetime(event.get("date"), errors="coerce", utc=True)
+        keys: set[str] = set()
+        for sport in payload.get("sports", []) or []:
+            for league in sport.get("leagues", []) or []:
+                for item in league.get("teams", []) or []:
+                    team = item.get("team") or item
+                    name = (
+                        team.get("displayName")
+                        or team.get("shortDisplayName")
+                        or team.get("name")
+                    )
+                    key = canonical_club_key(name)
+                    if key:
+                        keys.add(key)
+        return keys
 
-        for team_idx, roster_block in enumerate(rosters[:2]):
-            roster = roster_block.get("roster") or []
-            team_name = ""
-            if team_idx < len(box_form):
-                team_name = ((box_form[team_idx].get("team") or {}).get("displayName") or "")
-            if not team_name:
-                team_name = ((roster_block.get("team") or {}).get("displayName") or "")
+    def recent_events_for_clubs(
+        events: list[dict[str, Any]],
+        club_keys: set[str],
+    ) -> list[dict[str, Any]]:
+        if not club_keys:
+            return []
+        # One previous-season lineup is enough to recover a missing club's
+        # scoring roles. Current-season matches still use the full recent window.
+        fallback_role_matches = 1
+        counts = {key: 0 for key in club_keys}
+        selected: list[dict[str, Any]] = []
+        for event in events:
+            event_keys = event_club_keys(event) & club_keys
+            if not event_keys or not any(counts[key] < fallback_role_matches for key in event_keys):
+                continue
+            selected.append(event)
+            for key in event_keys:
+                counts[key] += 1
+            if all(count >= fallback_role_matches for count in counts.values()):
+                break
+            if len(selected) >= 36:
+                break
+        return selected
 
-            for p in roster:
-                athlete = p.get("athlete") or {}
-                name = athlete.get("displayName")
-                if not name:
+    def lineup_rows_for_events(
+        events: list[dict[str, Any]],
+        *,
+        season_used: int,
+        allowed_club_keys: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        def summary_for_event(event: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+            event_id = str(event.get("id", ""))
+            if not event_id:
+                return event, None
+            try:
+                return event, _direct_json(f"{base}/summary?event={event_id}")
+            except Exception:
+                return event, None
+
+        workers = min(6, max(1, len(events)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            summaries = list(executor.map(summary_for_event, events))
+
+        for event, data in summaries:
+            if data is None:
+                continue
+            event_id = str(event.get("id", ""))
+
+            rosters = data.get("rosters") or []
+            box_form = ((data.get("boxscore") or {}).get("form") or [])
+            event_date = pd.to_datetime(event.get("date"), errors="coerce", utc=True)
+
+            for team_idx, roster_block in enumerate(rosters[:2]):
+                roster = roster_block.get("roster") or []
+                team_name = ""
+                if team_idx < len(box_form):
+                    team_name = ((box_form[team_idx].get("team") or {}).get("displayName") or "")
+                if not team_name:
+                    team_name = ((roster_block.get("team") or {}).get("displayName") or "")
+                if allowed_club_keys is not None and canonical_club_key(team_name) not in allowed_club_keys:
                     continue
 
-                starter = bool(p.get("starter", False))
-                sub_in_obj = p.get("subbedIn")
-                sub_out_obj = p.get("subbedOut")
+                for p in roster:
+                    athlete = p.get("athlete") or {}
+                    name = athlete.get("displayName")
+                    if not name:
+                        continue
 
-                def did_sub(obj: Any) -> bool:
-                    if isinstance(obj, bool):
-                        return obj
-                    if isinstance(obj, dict):
-                        return bool(obj.get("didSub"))
-                    return False
+                    starter = bool(p.get("starter", False))
+                    sub_in_obj = p.get("subbedIn")
+                    sub_out_obj = p.get("subbedOut")
 
-                did_in = did_sub(sub_in_obj)
-                did_out = did_sub(sub_out_obj)
+                    def did_sub(obj: Any) -> bool:
+                        if isinstance(obj, bool):
+                            return obj
+                        if isinstance(obj, dict):
+                            return bool(obj.get("didSub"))
+                        return False
 
-                if starter:
-                    minute_in = 0.0
-                elif did_in:
-                    minute_in = _sub_clock(sub_in_obj)
-                else:
-                    minute_in = None
+                    did_in = did_sub(sub_in_obj)
+                    did_out = did_sub(sub_out_obj)
 
-                if (starter or did_in) and not did_out:
-                    minute_out = 90.0
-                elif did_out:
-                    minute_out = _sub_clock(sub_out_obj)
-                else:
-                    minute_out = None
+                    if starter:
+                        minute_in = 0.0
+                    elif did_in:
+                        minute_in = _sub_clock(sub_in_obj)
+                    else:
+                        minute_in = None
 
-                if minute_in is None:
-                    minutes = 0.0
-                else:
-                    minutes = max(0.0, min(90.0, (minute_out if minute_out is not None else 90.0) - minute_in))
+                    if (starter or did_in) and not did_out:
+                        minute_out = 90.0
+                    elif did_out:
+                        minute_out = _sub_clock(sub_out_obj)
+                    else:
+                        minute_out = None
 
-                rows.append(
-                    {
-                        "name": str(name),
-                        "club": str(team_name),
-                        "game_key": event_id,
-                        "event_date": event_date,
-                        "started": float(starter),
-                        "minutes": float(minutes),
-                    }
+                    if minute_in is None:
+                        minutes = 0.0
+                    else:
+                        minutes = max(
+                            0.0,
+                            min(
+                                90.0,
+                                (minute_out if minute_out is not None else 90.0) - minute_in,
+                            ),
+                        )
+
+                    rows.append(
+                        {
+                            "name": str(name),
+                            "club": str(team_name),
+                            "game_key": event_id,
+                            "event_date": event_date,
+                            "started": float(starter),
+                            "minutes": float(minutes),
+                            "position": _espn_position_group(p.get("position")),
+                            "espn_season_used": int(season_used),
+                            "espn_is_previous_season": bool(season_used != requested_season),
+                        }
+                    )
+        return rows
+
+    call_cap = min(36, max(12, recent_limit * 8))
+    current_events = completed_events_for_season(requested_season)
+    rows: list[dict[str, Any]] = []
+
+    if current_events:
+        current_events = current_events[:call_cap]
+        rows.extend(
+            lineup_rows_for_events(
+                current_events,
+                season_used=requested_season,
+            )
+        )
+
+        # At the beginning of a split/postponed matchday, some current clubs
+        # have no completed match and therefore no lineup role. Fill only those
+        # clubs from last season; current-season lineups always take precedence.
+        expected_clubs = current_club_keys()
+        for event in current_events:
+            expected_clubs |= event_club_keys(event)
+        represented = {canonical_club_key(row.get("club")) for row in rows}
+        missing_clubs = {key for key in expected_clubs if key and key not in represented}
+        if missing_clubs:
+            previous_events = completed_events_for_season(requested_season - 1)
+            selected_previous = recent_events_for_clubs(previous_events, missing_clubs)
+            rows.extend(
+                lineup_rows_for_events(
+                    selected_previous,
+                    season_used=requested_season - 1,
+                    allowed_club_keys=missing_clubs,
                 )
+            )
+    else:
+        # Useful before the new season's first completed league match.
+        previous_events = completed_events_for_season(requested_season - 1)
+        rows.extend(
+            lineup_rows_for_events(
+                previous_events[:call_cap],
+                season_used=requested_season - 1,
+            )
+        )
+
+    if not rows:
+        raise SoccerDataError("ESPN direct fallback found no usable completed-match lineups.")
 
     lineup = pd.DataFrame(rows)
-    if lineup.empty:
-        raise SoccerDataError("ESPN direct fallback returned no usable lineup rows.")
-
     lineup = lineup.sort_values(["event_date", "game_key"], na_position="first")
     result_rows: list[dict[str, Any]] = []
     for (name, club), group in lineup.groupby(["name", "club"], sort=False):
-        recent = group.tail(max(1, int(recent_matches)))
+        recent = group.tail(recent_limit)
+        latest = recent.iloc[-1]
         result_rows.append(
             {
                 "name": name,
@@ -719,8 +969,9 @@ def _direct_espn_recent(
                 "recent_lineup_matches": float(len(recent)),
                 "recent_minutes": float(recent["minutes"].mean()),
                 "espn_recent_starts": float(recent["started"].sum()),
-                "espn_season_used": int(season_used),
-                "espn_is_previous_season": bool(season_used != requested_season),
+                "espn_position": _dominant_espn_position(recent),
+                "espn_season_used": int(latest["espn_season_used"]),
+                "espn_is_previous_season": bool(latest["espn_is_previous_season"]),
             }
         )
     return pd.DataFrame(result_rows)
@@ -1316,13 +1567,15 @@ def _merge_recent_espn(players: pd.DataFrame, recent: pd.DataFrame) -> tuple[pd.
 
     # Keep freshness metadata before the generic lineup merge (which intentionally
     # only copies lineup fields).
-    metadata: dict[tuple[str, str], tuple[float | None, bool]] = {}
+    metadata: dict[tuple[str, str], tuple[float | None, bool, str]] = {}
     for _, row in recent.iterrows():
         key = (normalize_name(row.get("name")), canonical_club_key(row.get("club")))
         season_value = safe_float(row.get("espn_season_used"), np.nan)
+        espn_position = str(row.get("espn_position") or "").strip().upper()
         metadata[key] = (
             season_value if np.isfinite(season_value) else None,
             bool(row.get("espn_is_previous_season", False)),
+            espn_position if espn_position in {"GK", "DEF", "MID", "FWD"} else "",
         )
 
     result = merge_recent_lineup_history(players, recent)
@@ -1339,10 +1592,20 @@ def _merge_recent_espn(players: pd.DataFrame, recent: pd.DataFrame) -> tuple[pd.
             key = (normalize_name(row.get("name")), canonical_club_key(row.get("club")))
             if key not in metadata:
                 continue
-            season_value, stale = metadata[key]
+            season_value, stale, espn_position = metadata[key]
             if season_value is not None:
                 result.at[idx, "espn_season_used"] = season_value
             result.at[idx, "espn_is_previous_season"] = bool(stale)
+            if espn_position:
+                # ``position`` is the role consumed by the position-specific
+                # xP models and FPL-style scoring. Understat's aggregate role
+                # string is unordered, so a recent ESPN formation role is the
+                # safer internal scoring input. It also improves the label when
+                # the table displays this field, but the xP correction is the
+                # important behavior.
+                result.at[idx, "espn_position"] = espn_position
+                result.at[idx, "position"] = espn_position
+                result.at[idx, "position_source"] = "ESPN recent lineup"
     return result, matched
 
 
