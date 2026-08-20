@@ -523,6 +523,17 @@ def _live_availability(
 
 def _statistical_projection(frame: pd.DataFrame) -> np.ndarray:
     p = engineer_features(frame)
+    # Source-specific prediction views supply their own expected minutes. Keep
+    # that live availability signal instead of recomputing season-average
+    # minutes inside ``engineer_features``.
+    if "minutes_per_appearance" in frame.columns:
+        supplied_minutes = pd.to_numeric(
+            frame["minutes_per_appearance"], errors="coerce"
+        )
+        valid_minutes = supplied_minutes.notna()
+        p.loc[valid_minutes, "minutes_per_appearance"] = supplied_minutes.loc[
+            valid_minutes
+        ].clip(0.0, 90.0)
     goal_points = p["position"].map({"GK": 6.0, "DEF": 6.0, "MID": 5.0, "FWD": 4.0}).fillna(4.5)
     clean_points = p["position"].map({"GK": 4.0, "DEF": 4.0, "MID": 1.0, "FWD": 0.0}).fillna(1.0)
     appearance = (
@@ -548,6 +559,42 @@ def _statistical_projection(frame: pd.DataFrame) -> np.ndarray:
         + 0.10 * (p["team_strength"].clip(0, 1) - p["opponent_strength"].clip(0, 1))
     ).clip(0.70, 1.35)
     return np.maximum((attack + defence + base) * fixture, 0.0).to_numpy()
+
+
+def _cross_league_point_blend(
+    frame: pd.DataFrame,
+    model_projection: np.ndarray,
+) -> np.ndarray:
+    """Anchor transferred PL-model xP to transparent fantasy scoring.
+
+    The bundled point models are trained on Premier League labels. Their raw
+    cross-league extrapolation can rank an elite 0.8-xG/90 forward below a
+    low-attacking defender even when both have similar availability. Blend in a
+    direct goals/xG/assists/xA fantasy calculation for non-FPL rows so attacking
+    output remains meaningful. The anchor grows from 35% to 70% with sample
+    size, limiting one-match noise while trusting established season records.
+    """
+    values = np.maximum(np.asarray(model_projection, dtype=float), 0.0)
+    if "official_fpl_xp" in frame.columns or frame.empty:
+        return values
+
+    statistical = np.maximum(_statistical_projection(frame), 0.0)
+    if "understat_matches" in frame.columns:
+        sample = pd.to_numeric(frame["understat_matches"], errors="coerce")
+    else:
+        sample = pd.to_numeric(
+            frame.get("appearances", pd.Series(0.0, index=frame.index)),
+            errors="coerce",
+        )
+    sample = sample.fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+    weight = 0.35 + 0.35 * np.clip(sample / 10.0, 0.0, 1.0)
+    valid = np.isfinite(statistical)
+    blended = values.copy()
+    blended[valid] = (
+        (1.0 - weight[valid]) * values[valid]
+        + weight[valid] * statistical[valid]
+    )
+    return np.maximum(blended, 0.0)
 
 
 def _estimate_missing_prices_ml_legacy(
@@ -1766,6 +1813,8 @@ def _point_projection_for_source(
                 + np.maximum(appearance_values - start_values, 0.0) * substitute_points
             )
             predicted = 0.80 * direct + 0.20 * role_expected
+
+        predicted = _cross_league_point_blend(rows, predicted)
 
         unavailable = (
             (pd.to_numeric(rows["fixture_count"], errors="coerce").fillna(0.0).to_numpy() <= 0)
