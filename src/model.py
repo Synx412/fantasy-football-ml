@@ -1442,6 +1442,34 @@ def _restore_base_provider_features(frame: pd.DataFrame) -> pd.DataFrame:
     return view
 
 
+def _blend_ml_start_probability(
+    frame: pd.DataFrame,
+    ml_start: np.ndarray,
+    provider_start: np.ndarray,
+) -> np.ndarray:
+    """Blend availability without erasing competition-specific role evidence.
+
+    The bundled classifier is trained on Premier League/FPL rows.  Its score is
+    useful as a cross-league correction, but it is not calibrated strongly
+    enough to replace a live league provider's starts-per-team-match prior.  A
+    55% model weight made every opening-round La Liga player fall below 60%,
+    including players who had just started.  Official FPL keeps the validated
+    55/45 blend; other providers keep 75% of their league-specific role prior.
+    """
+    model_values = np.clip(np.asarray(ml_start, dtype=float), 0.0, 1.0)
+    provider_values = np.clip(np.asarray(provider_start, dtype=float), 0.0, 1.0)
+    if len(model_values) != len(provider_values):
+        raise ValueError("ML and provider start-probability arrays must have equal length.")
+
+    provider_weight = 0.45 if "official_fpl_xp" in frame.columns else 0.75
+    return np.clip(
+        (1.0 - provider_weight) * model_values
+        + provider_weight * provider_values,
+        0.0,
+        1.0,
+    )
+
+
 def _availability_without_cross_source(
     bundle: _ModelBundle,
     frame: pd.DataFrame,
@@ -1465,7 +1493,7 @@ def _availability_without_cross_source(
 
     if bundle.start_model is not None:
         ml_start = _probability(bundle.start_model, frame)
-        start = 0.55 * ml_start + 0.45 * historical_start
+        start = _blend_ml_start_probability(frame, ml_start, historical_start)
 
         matches = pd.to_numeric(
             frame.get("team_matches_observed", pd.Series(0.0, index=frame.index)),
@@ -2042,8 +2070,10 @@ def predict_players(
     expected_minutes = current["minutes_per_appearance"].to_numpy()
     if bundle.start_model is not None:
         ml_start_probability = _probability(bundle.start_model, current)
-        start_probability = (
-            0.55 * ml_start_probability + 0.45 * historical_start_probability
+        start_probability = _blend_ml_start_probability(
+            current,
+            ml_start_probability,
+            historical_start_probability,
         )
         # Guard against the exact failure exposed by rotation players such as
         # Marmoush/Gabriel Jesus: a model score must not jump a low real-world

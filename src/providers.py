@@ -738,31 +738,109 @@ def _round_number(value: object) -> Optional[int]:
     return int(numbers[-1]) if numbers else None
 
 
+def _main_round_start(dates: list[datetime], span_days: float = 6.0) -> datetime:
+    """Find the first kickoff in a round's main fixture cluster."""
+    ordered = sorted(dates)
+    if not ordered:
+        raise ValueError("Cannot infer a matchday start without fixture dates.")
+
+    best_left = best_right = left = 0
+    max_seconds = float(span_days) * 86400.0
+    for right, current in enumerate(ordered):
+        while left < right and (current - ordered[left]).total_seconds() > max_seconds:
+            left += 1
+        current_size = right - left + 1
+        best_size = best_right - best_left + 1
+        if current_size > best_size:
+            best_left, best_right = left, right
+    return ordered[best_left]
+
+
+def _matchday_start_windows(
+    fixtures: list[dict[str, Any]],
+) -> list[tuple[int, datetime]]:
+    """Infer when each official matchday actually begins.
+
+    The densest six-day cluster ignores isolated postponed or brought-forward
+    fixtures, so an outlier cannot redefine the whole matchday window.
+    """
+    round_dates: dict[int, list[datetime]] = {}
+    for item in fixtures:
+        fixture = item.get("fixture", {}) or {}
+        kickoff = _parse_datetime(fixture.get("date"))
+        round_label = (item.get("league", {}) or {}).get("round") or fixture.get("round")
+        round_number = _round_number(round_label)
+        if kickoff is None or round_number is None:
+            continue
+        round_dates.setdefault(round_number, []).append(kickoff)
+
+    windows = [
+        (round_number, _main_round_start(dates))
+        for round_number, dates in round_dates.items()
+        if dates
+    ]
+    return sorted(windows, key=lambda item: item[1])
+
+
+def _active_matchday(
+    kickoff: datetime,
+    original_round: Optional[int],
+    matchday_windows: list[tuple[int, datetime]],
+) -> Optional[int]:
+    started = [
+        (round_number, start)
+        for round_number, start in matchday_windows
+        if start <= kickoff
+    ]
+    if not started:
+        return original_round
+    # The latest matchday window already open at kickoff owns the fixture.
+    return max(started, key=lambda item: item[1])[0]
+
+
 def _periodize_upcoming(
     matches: list[dict[str, Any]],
     horizon: int,
+    matchday_windows: Optional[list[tuple[int, datetime]]] = None,
 ) -> list[list[dict[str, Any]]]:
     ordered = sorted(matches, key=lambda item: item["date"])
     periods: list[list[dict[str, Any]]] = []
-    for match in ordered:
+    period_keys: list[object] = []
+    windows = matchday_windows or []
+    for raw_match in ordered:
+        match = raw_match.copy()
+        original_round = _round_number(match.get("round"))
+        fantasy_matchday = _active_matchday(
+            match["date"], original_round, windows
+        )
+        match["fantasy_matchday"] = fantasy_matchday
+        period_key: object = (
+            ("matchday", fantasy_matchday)
+            if fantasy_matchday is not None
+            else ("round", str(match.get("round") or ""))
+        )
+
         if not periods:
             periods.append([match])
+            period_keys.append(period_key)
             continue
         previous = periods[-1][-1]
-        same_round = str(match.get("round") or "") == str(previous.get("round") or "")
+        same_matchday = period_key == period_keys[-1]
         days_apart = abs((match["date"] - previous["date"]).total_seconds()) / 86400.0
         current_round = _round_number(match.get("round"))
         previous_round = _round_number(previous.get("round"))
         rescheduled_double = (
-            days_apart <= 5.0
+            not windows
+            and days_apart <= 5.0
             and current_round is not None
             and previous_round is not None
             and abs(current_round - previous_round) > 1
         )
-        if same_round or rescheduled_double:
+        if same_matchday or rescheduled_double:
             periods[-1].append(match)
         else:
             periods.append([match])
+            period_keys.append(period_key)
     return periods[: max(1, int(horizon))]
 
 
@@ -772,6 +850,7 @@ def build_team_context(
     now: Optional[datetime] = None,
 ) -> pd.DataFrame:
     now = now or datetime.now(timezone.utc)
+    matchday_windows = _matchday_start_windows(fixtures)
     teams: dict[int, str] = {}
     completed: dict[int, list[dict[str, Any]]] = {}
     upcoming: dict[int, list[dict[str, Any]]] = {}
@@ -867,7 +946,9 @@ def build_team_context(
 
         scenarios: list[dict[str, Any]] = []
         previous_date = last_date
-        for period_index, period in enumerate(_periodize_upcoming(next_matches, horizon)):
+        for period_index, period in enumerate(
+            _periodize_upcoming(next_matches, horizon, matchday_windows)
+        ):
             for match in period:
                 opponent_id = int(match["opponent_id"])
                 home = safe_float(match.get("home"), 0.5)
@@ -890,6 +971,8 @@ def build_team_context(
                         "fixture_count": 1.0,
                         "rest_days": float(np.clip(rest_days, 2, 21)),
                         "fixture_id": match.get("fixture_id"),
+                        "source_round": match.get("round"),
+                        "fantasy_matchday": match.get("fantasy_matchday"),
                         "period_index": period_index,
                     }
                 )
@@ -962,11 +1045,18 @@ def apply_team_context(players: pd.DataFrame, context: pd.DataFrame) -> pd.DataF
         return None
 
     result["_context_key"] = result["_club_key"].map(resolve_key)
+    previous_season_role = result.get(
+        "understat_is_previous_season",
+        pd.Series(False, index=result.index),
+    ).fillna(False).astype(bool)
     for col in update_cols:
         if col not in lookup.columns:
             continue
         mapped = result["_context_key"].map(lookup[col])
-        result.loc[mapped.notna(), col] = mapped[mapped.notna()]
+        update_mask = mapped.notna()
+        if col == "team_matches_observed":
+            update_mask &= ~previous_season_role
+        result.loc[update_mask, col] = mapped[update_mask]
 
     # Global correction: start probability is starts / TEAM MATCHES, not starts /
     # player appearances.  This is what prevents Marmoush/Jesus-style rotation
@@ -974,7 +1064,10 @@ def apply_team_context(players: pd.DataFrame, context: pd.DataFrame) -> pd.DataF
     if {"starts", "team_matches_observed"}.issubset(result.columns):
         starts = pd.to_numeric(result["starts"], errors="coerce").fillna(0.0)
         matches = pd.to_numeric(result["team_matches_observed"], errors="coerce")
-        valid = matches.notna() & (matches >= 0)
+        # A current fixture feed can report zero matches for a postponed club
+        # while its temporary player rows contain last season's starts.  Never
+        # divide those old starts by the new season's zero-match exposure.
+        valid = matches.notna() & (matches >= 0) & ~previous_season_role
         result.loc[valid, "start_probability"] = [
             estimate_start_probability(st, mt)
             for st, mt in zip(starts[valid], matches[valid])

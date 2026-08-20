@@ -726,6 +726,68 @@ def _direct_espn_recent(
     return pd.DataFrame(result_rows)
 
 
+def _understat_team_titles(data: dict[str, Any]) -> set[str]:
+    teams = data.get("teams") or {}
+    values = teams.values() if isinstance(teams, dict) else teams
+    titles: set[str] = set()
+    for item in values or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or "").strip()
+        if title:
+            titles.add(title)
+    return titles
+
+
+def _understat_player_frame(
+    data: dict[str, Any],
+    *,
+    requested_season: int,
+    season_used: int,
+    roster_fallback: bool = False,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for p in data.get("players") or []:
+        games = safe_float(p.get("games"), 0.0)
+        minutes = safe_float(p.get("time"), 0.0)
+        appearances = max(games, 0.0)
+        starts_est = min(appearances, max(0.0, minutes / 75.0))
+        team = str(p.get("team_title") or "")
+        if "," in team:
+            team = team.split(",", 1)[0].strip()
+        rows.append(
+            {
+                "name": str(p.get("player_name") or ""),
+                "club": team,
+                "position": _position_group(p.get("position")),
+                "minutes": minutes,
+                "appearances": appearances,
+                "starts": starts_est,
+                "goals": safe_float(p.get("goals"), 0.0),
+                "assists": safe_float(p.get("assists"), 0.0),
+                "shots": safe_float(p.get("shots"), 0.0),
+                "xg": safe_float(p.get("xG"), 0.0),
+                "xa": safe_float(p.get("xA"), 0.0),
+                "yellow_cards": safe_float(p.get("yellow_cards"), 0.0),
+                "red_cards": safe_float(p.get("red_cards"), 0.0),
+                "xg_chain": safe_float(p.get("xGChain"), 0.0),
+                "xg_buildup": safe_float(p.get("xGBuildup"), 0.0),
+                "understat_matches": appearances,
+                "understat_season_used": int(season_used),
+                "understat_is_previous_season": bool(season_used != requested_season),
+                "understat_roster_fallback": bool(roster_fallback),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out[
+        out["name"].astype(str).str.len().gt(0)
+        & out["club"].astype(str).str.len().gt(0)
+    ].reset_index(drop=True)
+
+
 def _direct_understat_players(competition: str, season: int) -> pd.DataFrame:
     slug = UNDERSTAT_DIRECT_LEAGUES.get(competition)
     if not slug:
@@ -793,48 +855,48 @@ def _direct_understat_players(competition: str, season: int) -> pd.DataFrame:
                 f"{first_exc} | {second_exc}"
             ) from second_exc
 
-    players = data.get("players") or []
-    if not players:
+    out = _understat_player_frame(
+        data,
+        requested_season=requested,
+        season_used=season_to_use,
+    )
+    if out.empty:
         raise SoccerDataError(
             f"Understat returned no player rows for season {season_to_use}."
         )
 
-    rows: list[dict[str, Any]] = []
-    for p in players:
-        games = safe_float(p.get("games"), 0.0)
-        minutes = safe_float(p.get("time"), 0.0)
-        appearances = max(games, 0.0)
-        starts_est = min(appearances, max(0.0, minutes / 75.0))
-        team = str(p.get("team_title") or "")
-        if "," in team:
-            team = team.split(",", 1)[0].strip()
-        rows.append(
-            {
-                "name": str(p.get("player_name") or ""),
-                "club": team,
-                "position": _position_group(p.get("position")),
-                "minutes": minutes,
-                "appearances": appearances,
-                "starts": starts_est,
-                "goals": safe_float(p.get("goals"), 0.0),
-                "assists": safe_float(p.get("assists"), 0.0),
-                "shots": safe_float(p.get("shots"), 0.0),
-                "xg": safe_float(p.get("xG"), 0.0),
-                "xa": safe_float(p.get("xA"), 0.0),
-                "yellow_cards": safe_float(p.get("yellow_cards"), 0.0),
-                "red_cards": safe_float(p.get("red_cards"), 0.0),
-                "xg_chain": safe_float(p.get("xGChain"), 0.0),
-                "xg_buildup": safe_float(p.get("xGBuildup"), 0.0),
-                "understat_matches": appearances,
-                "understat_season_used": season_to_use,
-                "understat_is_previous_season": bool(season_to_use != requested),
-            }
-        )
+    # During a split/postponed opening round, Understat exposes all current clubs
+    # in ``teams`` but ``players`` only for clubs that have already played.  Use
+    # last season's rows for the missing current clubs so the app does not lose
+    # Barcelona/Real Madrid/etc. until their first fixture.  The rows are marked
+    # explicitly and disappear automatically once current-season data arrives.
+    current_clubs = _understat_team_titles(data)
+    represented = {canonical_club_key(club) for club in out["club"]}
+    missing_keys = {
+        canonical_club_key(club)
+        for club in current_clubs
+        if canonical_club_key(club) not in represented
+    }
+    if season_to_use == requested and missing_keys:
+        try:
+            previous_data = fetch_year(requested - 1)
+            previous = _understat_player_frame(
+                previous_data,
+                requested_season=requested,
+                season_used=requested - 1,
+                roster_fallback=True,
+            )
+            if not previous.empty:
+                previous = previous[
+                    previous["club"].map(canonical_club_key).isin(missing_keys)
+                ].copy()
+                if not previous.empty:
+                    out = pd.concat([out, previous], ignore_index=True)
+        except Exception:
+            # Current-season rows remain usable even if the temporary roster
+            # fallback cannot be fetched.
+            pass
 
-    out = pd.DataFrame(rows)
-    out = out[out["name"].astype(str).str.len().gt(0)].reset_index(drop=True)
-    if out.empty:
-        raise SoccerDataError("Understat direct fallback could not normalize player rows.")
     return out
 
 
@@ -1156,6 +1218,16 @@ def build_soccerdata_player_pool(bundle: SoccerDataBundle) -> pd.DataFrame:
             "starts": starts,
             "start_probability": start_probability.clip(0.0, 1.0),
             "team_matches_observed": team_matches,
+            "understat_matches": numeric_col("understat_matches"),
+            "understat_season_used": numeric_col("understat_season_used", np.nan),
+            "understat_is_previous_season": src.get(
+                "understat_is_previous_season",
+                pd.Series(False, index=src.index),
+            ).fillna(False).astype(bool),
+            "understat_roster_fallback": src.get(
+                "understat_roster_fallback",
+                pd.Series(False, index=src.index),
+            ).fillna(False).astype(bool),
             "rating": 6.0,
             "goals": numeric_col("goals"),
             "assists": numeric_col("assists"),
@@ -1288,9 +1360,12 @@ def _merge_club_strength(players: pd.DataFrame, bundle: SoccerDataBundle) -> tup
         if team_col and mp_col and pts_col:
             lookup: dict[str, tuple[float, float]] = {}
             for _, row in table.iterrows():
-                mp = max(safe_float(row.get(mp_col), 0.0), 1.0)
-                ppg = safe_float(row.get(pts_col), 0.0) / mp
-                lookup[canonical_club_key(row.get(team_col))] = (float(np.clip(ppg / 3.0, 0.0, 1.0)), mp)
+                mp = max(safe_float(row.get(mp_col), 0.0), 0.0)
+                ppg = safe_float(row.get(pts_col), 0.0) / max(mp, 1.0)
+                lookup[canonical_club_key(row.get(team_col))] = (
+                    float(np.clip(ppg / 3.0, 0.0, 1.0)),
+                    mp,
+                )
             for idx, row in result.iterrows():
                 key = canonical_club_key(row.get("club"))
                 if key in lookup:
@@ -1299,8 +1374,10 @@ def _merge_club_strength(players: pd.DataFrame, bundle: SoccerDataBundle) -> tup
                     result.at[idx, "team_strength"] = float(np.clip(0.80 * current + 0.20 * sofa_strength, 0.0, 1.0))
                     result.at[idx, "sofascore_strength"] = sofa_strength
                     result.at[idx, "soccerdata_sofascore"] = True
-                    result.at[idx, "team_matches_observed"] = mp
-                    if "starts" in result.columns:
+                    stale_role = bool(row.get("understat_is_previous_season", False))
+                    if not stale_role:
+                        result.at[idx, "team_matches_observed"] = mp
+                    if "starts" in result.columns and not stale_role:
                         result.at[idx, "start_probability"] = estimate_start_probability(row.get("starts"), mp)
                     matched_sofa += 1
 
