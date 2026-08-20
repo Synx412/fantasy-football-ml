@@ -15,6 +15,7 @@ from src.history import V8_HISTORY, load_bundled_history
 from src.model import (
     POINT_V2_PATH,
     PRETRAINED_MODEL_PATH,
+    _blend_ml_start_probability,
     _four_source_point_ensemble,
     _load_point_v2_artifact,
     _point_v2_predict,
@@ -122,9 +123,13 @@ def test_feature_semantics() -> None:
 def test_fixture_periods_and_preseason_neutrality() -> None:
     fixtures = [
         fixture(1, "2026-08-01T15:00:00+00:00", "Matchday 1", 1, "Alpha", 2, "Beta", status="FT", home_goals=2, away_goals=0),
+        fixture(30, "2026-08-19T15:00:00+00:00", "Matchday 3", 5, "Epsilon", 6, "Zeta"),
         fixture(2, "2026-08-20T15:00:00+00:00", "Matchday 10", 1, "Alpha", 2, "Beta"),
         fixture(3, "2026-08-23T15:00:00+00:00", "Matchday 3", 3, "Gamma", 1, "Alpha"),
-        fixture(4, "2026-08-30T15:00:00+00:00", "Matchday 11", 1, "Alpha", 4, "Delta"),
+        fixture(4, "2026-08-30T15:00:00+00:00", "Matchday 4", 1, "Alpha", 4, "Delta"),
+        fixture(31, "2026-10-20T15:00:00+00:00", "Matchday 10", 5, "Epsilon", 6, "Zeta"),
+        fixture(32, "2026-10-21T15:00:00+00:00", "Matchday 10", 7, "Eta", 8, "Theta"),
+        fixture(33, "2026-10-21T18:00:00+00:00", "Matchday 10", 9, "Iota", 10, "Kappa"),
     ]
     context = build_team_context(
         fixtures,
@@ -136,6 +141,54 @@ def test_fixture_periods_and_preseason_neutrality() -> None:
     assert len(scenarios) == 3
     assert [item["period_index"] for item in scenarios] == [0, 0, 1]
     assert alpha["next_fixture_ids"] == [2, 3, 4]
+
+    # If MD2 starts before Alpha plays its postponed MD1 fixture, both Alpha
+    # games belong to the active MD2 fantasy period and their xP is additive.
+    postponed = [
+        fixture(20, "2026-08-10T15:00:00+00:00", "Matchday 1", 3, "Gamma", 4, "Delta", status="FT", home_goals=1, away_goals=0),
+        fixture(21, "2026-08-11T15:00:00+00:00", "Matchday 1", 5, "Epsilon", 6, "Zeta", status="FT", home_goals=1, away_goals=1),
+        fixture(22, "2026-08-18T18:00:00+00:00", "Matchday 1", 1, "Alpha", 2, "Beta"),
+        fixture(23, "2026-08-16T15:00:00+00:00", "Matchday 2", 3, "Gamma", 4, "Delta"),
+        fixture(24, "2026-08-17T15:00:00+00:00", "Matchday 2", 1, "Alpha", 5, "Epsilon"),
+        fixture(25, "2026-08-17T18:00:00+00:00", "Matchday 2", 2, "Beta", 6, "Zeta"),
+    ]
+    postponed_context = build_team_context(
+        postponed,
+        horizon=1,
+        now=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    postponed_alpha = postponed_context[
+        postponed_context["club"] == "Alpha"
+    ].iloc[0]
+    postponed_scenarios = postponed_alpha["fixture_scenarios"]
+    assert postponed_alpha["next_fixture_ids"] == [24, 22]
+    assert float(postponed_alpha["fixture_count"]) == 2.0
+    assert [item["period_index"] for item in postponed_scenarios] == [0, 0]
+    assert [item["fantasy_matchday"] for item in postponed_scenarios] == [2, 2]
+    assert [item["source_round"] for item in postponed_scenarios] == [
+        "Matchday 2",
+        "Matchday 1",
+    ]
+
+    # Projection aggregation must count both fixtures, rather than merely
+    # displaying them in the same fantasy matchday.
+    double_player = demo_players("La Liga").iloc[[0]].copy().reset_index(drop=True)
+    double_player.at[0, "fixture_scenarios"] = postponed_scenarios
+    double_xp = float(
+        predict_players(double_player, history=None, horizon=1)
+        .players.iloc[0]["predicted_points"]
+    )
+    single_xp = []
+    for scenario in postponed_scenarios:
+        single_player = double_player.copy()
+        single_player.at[0, "fixture_scenarios"] = [scenario]
+        single_xp.append(
+            float(
+                predict_players(single_player, history=None, horizon=1)
+                .players.iloc[0]["predicted_points"]
+            )
+        )
+    assert np.isclose(double_xp, sum(single_xp))
 
     # No completed league games must mean neutral/unknown form, not "every team is terrible"
     # and every fixture is FDR 1.
@@ -215,6 +268,46 @@ def test_soccerdata_pool_rotation_denominator() -> None:
     expected_rotation = estimate_start_probability(8, 35)
     assert abs(float(rotation["start_probability"]) - expected_rotation) < 1e-9
     assert float(rotation["start_probability"]) < 0.25
+
+    previous = understat.iloc[[0]].copy()
+    previous["understat_matches"] = 35.0
+    previous["understat_season_used"] = 2025
+    previous["understat_is_previous_season"] = True
+    previous["understat_roster_fallback"] = True
+    previous_pool = build_soccerdata_player_pool(
+        SoccerDataBundle(previous, empty, empty, empty, empty, {})
+    )
+    assert bool(previous_pool.iloc[0]["understat_is_previous_season"])
+    assert bool(previous_pool.iloc[0]["understat_roster_fallback"])
+
+    prior_start = float(previous_pool.iloc[0]["start_probability"])
+    current_context = pd.DataFrame(
+        [{"club": "Alpha", "team_matches_observed": 0.0, "fixture_count": 1.0}]
+    )
+    contextual = apply_team_context(previous_pool, current_context)
+    assert float(contextual.iloc[0]["team_matches_observed"]) == 35.0
+    assert abs(float(contextual.iloc[0]["start_probability"]) - prior_start) < 1e-9
+
+
+def test_cross_league_start_blend() -> None:
+    provider = np.array([0.80, 0.20])
+    ml = np.array([0.30, 0.70])
+
+    cross_league = _blend_ml_start_probability(
+        pd.DataFrame({"data_source": ["SoccerData", "SoccerData"]}),
+        ml,
+        provider,
+    )
+    assert np.allclose(cross_league, [0.675, 0.325])
+    assert float(cross_league[0]) >= 0.60
+    assert float(cross_league[1]) < 0.60
+
+    official_fpl = _blend_ml_start_probability(
+        pd.DataFrame({"official_fpl_xp": [4.0, 2.0]}),
+        ml,
+        provider,
+    )
+    assert np.allclose(official_fpl, [0.525, 0.475])
 
 
 def _source_test_row(position: str = "FWD") -> pd.DataFrame:
@@ -393,6 +486,7 @@ def main() -> None:
     test_fixture_periods_and_preseason_neutrality()
     test_fpl_fixture_strength_and_rest()
     test_soccerdata_pool_rotation_denominator()
+    test_cross_league_start_blend()
     test_v7_source_logic(bundle)
     test_v8_scoring_features(history)
     test_lineup_intelligence()
