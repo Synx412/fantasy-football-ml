@@ -19,7 +19,7 @@ from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier, XGBRegressor
 
 from src.ensemble_models import BlendedClassifier, BlendedRegressor
-from src.preseason_prior import blend_preseason_role_prior
+from src.preseason_prior import blend_preseason_availability_prior, blend_preseason_role_prior
 
 
 NUMERIC_FEATURES = [
@@ -1483,6 +1483,9 @@ def _availability_without_cross_source(
             bundle.minutes_model.predict(frame[NUMERIC_FEATURES]), 0.0, 90.0
         )
 
+    start, appearance = blend_preseason_availability_prior(
+        frame, start, appearance
+    )
     appearance = np.maximum(appearance, start)
 
     # Predicted-lineup consensus is independent of FPL/ESPN/Understat/ClubElo,
@@ -2063,6 +2066,9 @@ def predict_players(
         expected_minutes = np.clip(
             bundle.minutes_model.predict(current[NUMERIC_FEATURES]), 0, 90
         )
+    start_probability, appearance_probability = blend_preseason_availability_prior(
+        current, start_probability, appearance_probability
+    )
     appearance_probability = np.maximum(appearance_probability, start_probability)
     start_probability, appearance_probability, expected_minutes = _live_availability(
         current,

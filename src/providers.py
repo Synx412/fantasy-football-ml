@@ -442,6 +442,7 @@ def fetch_fpl_players(horizon: int = 1) -> pd.DataFrame:
             {
                 "player_id": p.get("id"),
                 "name": p.get("web_name"),
+                "full_name": f"{p.get('first_name', '')} {p.get('second_name', '')}".strip(),
                 "club": team.get("name", str(team_id)),
                 "position": FPL_POSITION_MAP.get(p.get("element_type"), "MID"),
                 "price": safe_float(p.get("now_cost")) / 10.0,

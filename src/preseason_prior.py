@@ -81,6 +81,90 @@ def _prior_lookup() -> dict[tuple[str, str], dict[str, float]]:
     return lookup
 
 
+def _role_record(row: pd.Series, lookup: dict[tuple[str, str], dict[str, float]]) -> dict[str, float] | None:
+    position = str(row.get("position", "")).upper()
+    for candidate in (row.get("full_name"), row.get("name")):
+        key = _norm(candidate)
+        if not key:
+            continue
+        record = lookup.get((key, position))
+        if record is not None:
+            return record
+    return None
+
+
+def blend_preseason_availability_prior(
+    frame: pd.DataFrame,
+    start: np.ndarray,
+    appearance: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Blend the ML availability estimate with last season's role early in a new season.
+    # The prior is strongest before current-season evidence exists and decays quickly.
+    start_values = np.clip(np.asarray(start, dtype=float).copy(), 0.0, 1.0)
+    appearance_values = np.clip(
+        np.asarray(appearance, dtype=float).copy(), start_values, 1.0
+    )
+
+    # FPL-only. Other competitions keep their current availability path unchanged.
+    if "official_fpl_xp" not in frame.columns or "name" not in frame.columns:
+        return start_values, appearance_values
+
+    lookup = _prior_lookup()
+    if not lookup:
+        return start_values, appearance_values
+
+    matches = _team_match_evidence(frame)
+
+    for j, (_, row) in enumerate(frame.iterrows()):
+        record = _role_record(row, lookup)
+        if record is None:
+            continue
+
+        starts = max(float(record["starts"]), 0.0)
+        apps = max(float(record["appearances"]), starts)
+        if apps <= 0.0:
+            continue
+
+        # Combine season-wide role with how nailed the player was when available.
+        season_start_rate = np.clip(starts / 38.0, 0.0, 1.0)
+        conditional_start_rate = np.clip(starts / max(apps, 1.0), 0.0, 1.0)
+        prior_start = float(
+            np.clip(
+                0.70 * season_start_rate + 0.30 * conditional_start_rate,
+                0.0,
+                1.0,
+            )
+        )
+        prior_appearance = float(
+            np.clip(max(apps / 38.0, prior_start), 0.0, 1.0)
+        )
+
+        # Established roles matter more. Prior decays fast with real 2026/27 matches.
+        established = float(np.clip(starts / 20.0, 0.20, 1.0))
+        weight = float(
+            np.clip(
+                0.65 * np.exp(-float(matches[j]) / 3.0) * established,
+                0.0,
+                0.65,
+            )
+        )
+        if weight <= 0.0:
+            continue
+
+        start_values[j] = (
+            (1.0 - weight) * start_values[j] + weight * prior_start
+        )
+        appearance_values[j] = (
+            (1.0 - weight) * appearance_values[j] + weight * prior_appearance
+        )
+        appearance_values[j] = max(appearance_values[j], start_values[j])
+
+    return (
+        np.clip(start_values, 0.0, 1.0),
+        np.clip(appearance_values, 0.0, 1.0),
+    )
+
+
 def _team_match_evidence(frame: pd.DataFrame) -> np.ndarray:
     n = len(frame)
     observed = pd.to_numeric(
@@ -177,8 +261,7 @@ def preseason_role_prior(
     matches = _team_match_evidence(frame)
 
     for j, (_, row) in enumerate(frame.iterrows()):
-        position = str(row.get("position", "")).upper()
-        record = lookup.get((_norm(row.get("name")), position))
+        record = _role_record(row, lookup)
         if record is None:
             continue
 
