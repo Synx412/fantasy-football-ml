@@ -16,6 +16,7 @@ from src.model import (
     POINT_V2_PATH,
     PRETRAINED_MODEL_PATH,
     _blend_ml_start_probability,
+    _cross_league_point_blend,
     _four_source_point_ensemble,
     _load_point_v2_artifact,
     _point_v2_predict,
@@ -40,7 +41,14 @@ from src.providers import (
     estimate_missing_prices,
     estimate_start_probability,
 )
-from src.soccerdata_live import SoccerDataBundle, build_soccerdata_player_pool
+from src.soccerdata_live import (
+    SoccerDataBundle,
+    _dominant_espn_position,
+    _espn_position_group,
+    _position_group,
+    apply_soccerdata_bundle,
+    build_soccerdata_player_pool,
+)
 
 
 def fixture(
@@ -118,6 +126,94 @@ def test_feature_semantics() -> None:
     out = engineer_features(row).iloc[0]
     assert abs(float(out["minutes_per_appearance"]) - 400 / 30) < 1e-9
     assert abs(float(out["start_probability"]) - 8 / 30) < 1e-9
+
+
+def test_understat_multi_role_positions() -> None:
+    # Understat's aggregate position string is an unordered set of roles, not
+    # a primary-position ranking. Mixed outfield roles should use the neutral
+    # fantasy MID bucket so the player is not awarded DEF scoring or stripped
+    # of MID scoring merely because D/F happens to be the first token.
+    assert _position_group("D S") == "DEF"
+    assert _position_group("F S") == "FWD"
+    assert _position_group("M S") == "MID"
+    assert _position_group("F M S") == "MID"
+    assert _position_group("D M S") == "MID"
+    assert _position_group("D F M S") == "MID"
+    assert _position_group("GK S") == "GK"
+    assert _position_group("AMR") == "MID"
+    assert _position_group("FWR") == "FWD"
+
+
+def test_espn_scoring_position_override() -> None:
+    assert _espn_position_group(
+        {"displayName": "Center Defender", "abbreviation": "CD"}
+    ) == "DEF"
+    assert _espn_position_group(
+        {"displayName": "Attacking Midfielder", "abbreviation": "AM"}
+    ) == "MID"
+    assert _espn_position_group(
+        {"displayName": "Center Forward", "abbreviation": "CF"}
+    ) == "FWD"
+    assert _espn_position_group(
+        {"displayName": "Goalkeeper", "abbreviation": "G"}
+    ) == "GK"
+    assert _espn_position_group("Substitute") == ""
+    assert _espn_position_group(
+        {"name": "Substitute", "abbreviation": "SUB"}
+    ) == ""
+
+    role_history = pd.DataFrame(
+        [
+            {"position": "MID", "minutes": 90.0, "started": 1.0},
+            {"position": "FWD", "minutes": 20.0, "started": 0.0},
+            {"position": "MID", "minutes": 0.0, "started": 0.0},
+        ]
+    )
+    assert _dominant_espn_position(role_history) == "MID"
+
+    # The ESPN role must replace the unordered Understat role before feature
+    # engineering, otherwise the player is sent through the wrong xP model and
+    # receives the wrong FPL-style goal/clean-sheet scoring.
+    understat = pd.DataFrame(
+        [
+            {
+                "name": "Example Player",
+                "club": "Alpha",
+                "position": "DEF",
+                "appearances": 3.0,
+                "starts": 3.0,
+                "minutes": 270.0,
+            }
+        ]
+    )
+    recent = pd.DataFrame(
+        [
+            {
+                "name": "Example Player",
+                "club": "Alpha",
+                "recent_start_rate": 1.0,
+                "recent_lineup_matches": 3.0,
+                "recent_minutes": 90.0,
+                "espn_position": "FWD",
+                "espn_season_used": 2026,
+                "espn_is_previous_season": False,
+            }
+        ]
+    )
+    empty = pd.DataFrame()
+    pool = build_soccerdata_player_pool(
+        SoccerDataBundle(understat, empty, empty, empty, empty, {})
+    )
+    corrected, counts = apply_soccerdata_bundle(
+        pool,
+        SoccerDataBundle(understat, recent, empty, empty, empty, {}),
+    )
+    assert counts["ESPN"] == 1
+    assert corrected.iloc[0]["position"] == "FWD"
+    assert corrected.iloc[0]["espn_position"] == "FWD"
+    features = engineer_features(corrected).iloc[0]
+    assert float(features["is_fwd"]) == 1.0
+    assert float(features["is_def"]) == 0.0
 
 
 def test_fixture_periods_and_preseason_neutrality() -> None:
@@ -310,6 +406,56 @@ def test_cross_league_start_blend() -> None:
     assert np.allclose(official_fpl, [0.525, 0.475])
 
 
+def test_cross_league_point_fairness_anchor() -> None:
+    players = pd.DataFrame(
+        [
+            {
+                "position": "FWD",
+                "minutes": 2700.0,
+                "appearances": 30.0,
+                "team_matches_observed": 30.0,
+                "starts": 27.0,
+                "start_probability": 0.80,
+                "minutes_per_appearance": 70.0,
+                "goals": 20.0,
+                "assists": 6.0,
+                "xg": 24.0,
+                "xa": 8.0,
+                "understat_matches": 30.0,
+                "chance_playing": 1.0,
+                "fixture_count": 1.0,
+            },
+            {
+                "position": "DEF",
+                "minutes": 2700.0,
+                "appearances": 30.0,
+                "team_matches_observed": 30.0,
+                "starts": 27.0,
+                "start_probability": 0.80,
+                "minutes_per_appearance": 70.0,
+                "goals": 1.0,
+                "assists": 1.0,
+                "xg": 1.0,
+                "xa": 1.0,
+                "understat_matches": 30.0,
+                "chance_playing": 1.0,
+                "fixture_count": 1.0,
+            },
+        ]
+    )
+    transferred_model = np.array([0.80, 1.60])
+    corrected = _cross_league_point_blend(players, transferred_model)
+    assert float(corrected[0]) > float(transferred_model[0])
+    assert float(corrected[0]) > float(corrected[1])
+
+    official = players.copy()
+    official["official_fpl_xp"] = np.nan
+    assert np.allclose(
+        _cross_league_point_blend(official, transferred_model),
+        transferred_model,
+    )
+
+
 def _source_test_row(position: str = "FWD") -> pd.DataFrame:
     pool = demo_players("Premier League")
     row = pool[pool["position"] == position].iloc[[0]].copy().reset_index(drop=True)
@@ -483,10 +629,13 @@ def main() -> None:
 
     bundle = test_model_artifacts(history)
     test_feature_semantics()
+    test_understat_multi_role_positions()
+    test_espn_scoring_position_override()
     test_fixture_periods_and_preseason_neutrality()
     test_fpl_fixture_strength_and_rest()
     test_soccerdata_pool_rotation_denominator()
     test_cross_league_start_blend()
+    test_cross_league_point_fairness_anchor()
     test_v7_source_logic(bundle)
     test_v8_scoring_features(history)
     test_lineup_intelligence()
