@@ -169,6 +169,17 @@ def fixture_count_from_players(players: pd.DataFrame) -> int:
     return len(fixture_ids)
 
 
+def eligibility_shortfalls(players: pd.DataFrame, config) -> list[str]:
+    problems: list[str] = []
+    if len(players) < int(config.squad_size):
+        problems.append(f"players {len(players)}/{config.squad_size}")
+    for position, (minimum, _) in config.position_limits.items():
+        count = int(players["position"].eq(position).sum())
+        if count < int(minimum):
+            problems.append(f"{position} {count}/{minimum}")
+    return problems
+
+
 def render_team_pitch(team: pd.DataFrame, captain: str, vice: str) -> None:
     for position in ["GK", "DEF", "MID", "FWD"]:
         row = team[team["position"] == position].sort_values("predicted_points", ascending=False)
@@ -452,6 +463,20 @@ def render_competition(
                                 f"{source_name} ❌ — {info.get('message', 'unknown SoccerData failure')}"
                             )
 
+                roster_fallback = players.get(
+                    "understat_roster_fallback",
+                    pd.Series(False, index=players.index),
+                ).fillna(False).astype(bool)
+                if roster_fallback.any():
+                    fallback_clubs = sorted(
+                        players.loc[roster_fallback, "club"].dropna().astype(str).unique()
+                    )
+                    st.info(
+                        f"Opening-round roster fallback: {int(roster_fallback.sum())} rows across "
+                        f"{len(fallback_clubs)} postponed clubs use last season's role data until "
+                        "those clubs play their first current-season match."
+                    )
+
             if public_enrichment_file is not None:
                 players = merge_public_enrichment(players, read_uploaded_csv(public_enrichment_file))
                 matched = int(players.get("public_data_match", pd.Series(False, index=players.index)).sum())
@@ -513,6 +538,7 @@ def render_competition(
             help="Higher values prefer steadier projections over volatile upside.",
         )
         eligible = predicted[predicted["start_probability"] >= minimum_start].copy()
+        shortfalls = eligibility_shortfalls(eligible, config)
 
         price_sources = predicted["price_source"].fillna("").astype(str)
         exact_prices = (
@@ -556,7 +582,18 @@ def render_competition(
                 "This cross-league transfer model is useful as a baseline, not a league-specific accuracy guarantee."
             )
 
-        if st.button("Generate best team", type="primary", key=f"optimize_{config.key}"):
+        if shortfalls:
+            st.warning(
+                f"The {minimum_start:.0%} start filter cannot form a valid squad yet "
+                f"({', '.join(shortfalls)}). Lower the filter or refresh the live sources."
+            )
+
+        if st.button(
+            "Generate best team",
+            type="primary",
+            key=f"optimize_{config.key}",
+            disabled=bool(shortfalls),
+        ):
             team = optimize_team(
                 eligible,
                 squad_size=config.squad_size,
@@ -622,11 +659,20 @@ def render_competition(
                 )
             )
             if not show_excluded:
-                rankings = rankings[rankings["start_probability"] >= minimum_start].copy()
-                st.caption(
-                    f"Showing only players with at least {minimum_start:.0%} start probability. "
-                    "Turn on the option above to inspect excluded players."
-                )
+                filtered_rankings = rankings[
+                    rankings["start_probability"] >= minimum_start
+                ].copy()
+                if filtered_rankings.empty and not rankings.empty:
+                    st.warning(
+                        f"No player reached the {minimum_start:.0%} start threshold. "
+                        "Showing all players so the table never fails silently."
+                    )
+                else:
+                    rankings = filtered_rankings
+                    st.caption(
+                        f"Showing only players with at least {minimum_start:.0%} start probability. "
+                        "Turn on the option above to inspect excluded players."
+                    )
 
             source_xp_columns = [
                 "xp_base_provider",
