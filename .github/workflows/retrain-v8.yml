@@ -1,1 +1,56 @@
+name: Retrain FPL v8.1 on 2025-26
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/retrain-v8.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Retrain on 2025-26 defensive-contribution data
+        run: |
+          python scripts/train_fpl_v8.py             --input data/fpl_multitask_training_2025_26.csv             --heldout-start-gw 31
+
+      - name: Run full smoke test
+        run: python tests/smoke_test.py
+
+      - name: Show validation report
+        run: cat models/fpl_v8_report.json
+
+      - name: Commit validated model artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add models/fpl_points_v2.joblib
+          git add models/fpl_multitask_bundle.joblib
+          git add models/fpl_v8_report.json
+
+          if git diff --cached --quiet; then
+            echo "No model changes to commit."
+          else
+            git commit -m "Retrain v8.1 on 2025-26 defensive-contribution data"
+            git push
+          fi
