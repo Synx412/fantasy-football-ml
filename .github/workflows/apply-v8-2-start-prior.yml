@@ -36,7 +36,7 @@ jobs:
           python /tmp/apply_v8_2.py
 
       - name: Run focused regression
-        run: python tests/preseason_start_prior_test.py
+        run: PYTHONPATH=. python tests/preseason_start_prior_test.py
 
       - name: Run full smoke test
         run: python tests/smoke_test.py
