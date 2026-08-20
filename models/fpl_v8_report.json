@@ -1,0 +1,83 @@
+{
+  "model_version": "v8.1",
+  "training_season": "2025-26",
+  "point_model": {
+    "heldout_gameweeks": "31-38",
+    "model_only": {
+      "rows": 6582,
+      "mae": 0.9926744836143759,
+      "rmse": 1.9232809942523807,
+      "mean_gw_spearman": 0.6747799224618474,
+      "top10_overlap": 0.1375,
+      "top25_overlap": 0.165
+    },
+    "official_fpl_single_fixture": {
+      "status": "not_used_for_weight_selection",
+      "reason": "historical xP timing is not guaranteed pre-deadline"
+    },
+    "base_blend_single_fixture": {
+      "rows": 6582,
+      "mae": 0.9926744836143759,
+      "rmse": 1.9232809942523807,
+      "mean_gw_spearman": 0.6747799224618474,
+      "top10_overlap": 0.1375,
+      "top25_overlap": 0.165
+    },
+    "selected_official_base_blend": 0.0,
+    "per_position": {
+      "GK": {
+        "rows": 763,
+        "mae": 0.6512099115188974,
+        "rmse": 1.486384961335358,
+        "mean_gw_spearman": 0.5803395497060193,
+        "top10_overlap": 0.4375,
+        "top25_overlap": 0.6749999999999999
+      },
+      "DEF": {
+        "rows": 2123,
+        "mae": 1.1484660918388325,
+        "rmse": 2.0876143337392024,
+        "mean_gw_spearman": 0.6176242633185092,
+        "top10_overlap": 0.125,
+        "top25_overlap": 0.28500000000000003
+      },
+      "MID": {
+        "rows": 2962,
+        "mae": 0.9174711180196155,
+        "rmse": 1.7905383141749134,
+        "mean_gw_spearman": 0.7125895722706971,
+        "top10_overlap": 0.17500000000000002,
+        "top25_overlap": 0.28
+      },
+      "FWD": {
+        "rows": 734,
+        "mae": 1.2005004415707916,
+        "rmse": 2.30878691466177,
+        "mean_gw_spearman": 0.7228876653478689,
+        "top10_overlap": 0.275,
+        "top25_overlap": 0.6749999999999999
+      }
+    },
+    "rows": 6582,
+    "model_only_mae": 0.9926744836143759,
+    "model_only_mean_gw_spearman": 0.6747799224618474,
+    "base_fpl_50_50_single_fixture_mae": 0.9926744836143759,
+    "base_fpl_50_50_single_fixture_mean_gw_spearman": 0.6747799224618474
+  },
+  "availability_model": {
+    "training_rows": 29757,
+    "point_mae": 1.0047934414895527,
+    "start_brier": 0.09474026309821698,
+    "appearance_brier": 0.09639533826848883,
+    "minutes_mae": 15.059039193791786,
+    "trained_availability": [
+      "start",
+      "appearance",
+      "minutes"
+    ]
+  },
+  "artifacts": {
+    "point": "models/fpl_points_v2.joblib",
+    "multitask": "models/fpl_multitask_bundle.joblib"
+  }
+}
